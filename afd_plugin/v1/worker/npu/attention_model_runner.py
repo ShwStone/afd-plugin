@@ -90,8 +90,9 @@ from afd_plugin.v1.worker.npu.pcp_debug import (
     snapshot_pcp_manager_state,
 )
 from afd_plugin.v1.worker.npu.ubatch_utils import (
+    ASYNC_MOE_SPLIT_TOKEN_BALANCED_TP,
     check_enable_ubatch,
-    create_request_boundary_ubatch_slices,
+    create_async_moe_ubatch_slices,
     maybe_create_ubatch_slices,
     pad_out_ubatch_slices,
     split_attn_metadata,
@@ -248,20 +249,26 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         if num_scheduled_tokens_np is None:
             return full_metadata
 
-        ubatch_slices = create_request_boundary_ubatch_slices(
+        ubatch_slices, split_mode = create_async_moe_ubatch_slices(
+            self.vllm_config,
             num_scheduled_tokens_np,
+            num_tokens=int(values.get("num_tokens", 0)),
+            num_tokens_padded=values.get("num_tokens_padded"),
+            num_reqs_padded=values.get("num_reqs_padded"),
             num_ubatches=self.afd_async_extra_info.async_moe_num_ubatches,
+            split=self.afd_async_extra_info.async_moe_split,
         )
         if ubatch_slices is None:
             return full_metadata
 
         logger.debug(
             "AFD NPU async MoE ubatch split; num_reqs=%s num_tokens=%s "
-            "num_scheduled_tokens=%s request_slices=%s token_slices=%s "
-            "stage_num_tokens=%s",
+            "num_scheduled_tokens=%s split_mode=%s request_slices=%s "
+            "token_slices=%s stage_num_tokens=%s",
             len(num_scheduled_tokens_np),
             int(values.get("num_tokens", 0)),
             num_scheduled_tokens_np.tolist(),
+            split_mode,
             [
                 (ubatch_slice.request_slice.start, ubatch_slice.request_slice.stop)
                 for ubatch_slice in ubatch_slices
@@ -289,6 +296,9 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_async_moe_ubatch_metadata = {
             "attn_metadata": stage_attn_metadata,
             "ubatch_slices": ubatch_slices,
+            "use_sp_local_ubatch_slices": (
+                split_mode == ASYNC_MOE_SPLIT_TOKEN_BALANCED_TP
+            ),
         }
         return full_metadata
 

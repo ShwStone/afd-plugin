@@ -19,6 +19,9 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
 )
 from afd_plugin.model_executor.models import AsyncMoeUbatchMetadata
+from afd_plugin.model_executor.models.npu.ubatch_sp import (
+    build_async_moe_stage_inputs,
+)
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
 if TYPE_CHECKING:
@@ -134,25 +137,23 @@ def run_async_moe_ubatch_afd_forward(
     if dense_end_layer == model.end_layer:
         return hidden_states, residual
 
-    stage_hidden_states = [
-        hidden_states[ubatch_slice.token_slice] for ubatch_slice in ubatch_slices
-    ]
-    stage_residual = [
-        _slice_optional_first_dim(residual, ubatch_slice.token_slice)
-        for ubatch_slice in ubatch_slices
-    ]
-    stage_positions = [
-        _slice_positions(positions, ubatch_slice.token_slice)
-        for ubatch_slice in ubatch_slices
-    ]
-    stage_llama_4_scaling = [
-        _slice_llama_4_scaling(
-            llama_4_scaling,
-            ubatch_slice.token_slice,
-            num_tokens=int(hidden_states.shape[0]),
-        )
-        for ubatch_slice in ubatch_slices
-    ]
+    (
+        stage_hidden_states,
+        stage_residual,
+        stage_positions,
+        stage_llama_4_scaling,
+        sp_local_ubatch_slices,
+    ) = build_async_moe_stage_inputs(
+        hidden_states=hidden_states,
+        residual=residual,
+        positions=positions,
+        llama_4_scaling=llama_4_scaling,
+        ubatch_slices=ubatch_slices,
+        use_sp_local_ubatch_slices=bool(
+            async_moe_ubatch_metadata.get("use_sp_local_ubatch_slices", False),
+        ),
+    )
+    async_moe_ubatch_metadata["sp_local_ubatch_slices"] = sp_local_ubatch_slices
 
     moe_start_layer = max(model.start_layer, first_moe_layer)
     moe_layers = list(islice(model.layers, moe_start_layer, model.end_layer))
@@ -161,7 +162,7 @@ def run_async_moe_ubatch_afd_forward(
         layer: AFDDeepseekV2DecoderLayer,
         stage_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        ubatch_slice = ubatch_slices[stage_idx]
+        sp_local_ubatch_slice = sp_local_ubatch_slices[stage_idx]
         with _use_async_moe_ubatch_forward_context(
             forward_context=forward_context,
             parent_afd_metadata=afd_metadata,
@@ -184,7 +185,7 @@ def run_async_moe_ubatch_afd_forward(
             raise RuntimeError(
                 "async_moe_ubatching requires Attention-side topk payloads",
             )
-        expected_tokens = int(ubatch_slice.num_tokens)
+        expected_tokens = int(sp_local_ubatch_slice.num_tokens)
         if int(stage_hidden_states[stage_idx].shape[0]) != expected_tokens:
             raise RuntimeError(
                 "async_moe_ubatching stage output token count mismatch: "
@@ -200,7 +201,7 @@ def run_async_moe_ubatch_afd_forward(
         topk_ids: torch.Tensor,
         router_logits: torch.Tensor | None,
     ) -> None:
-        expected_tokens = int(ubatch_slices[stage_idx].num_tokens)
+        expected_tokens = int(sp_local_ubatch_slices[stage_idx].num_tokens)
         stage_metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=layer.layer_idx,
             stage_idx=stage_idx,
@@ -301,10 +302,14 @@ def _use_async_moe_ubatch_forward_context(
     stage_idx: int,
 ) -> Iterator[None]:
     ubatch_slices = async_moe_ubatch_metadata["ubatch_slices"]
+    sp_local_ubatch_slices = async_moe_ubatch_metadata.get(
+        "sp_local_ubatch_slices",
+        ubatch_slices,
+    )
     attn_metadata = async_moe_ubatch_metadata["attn_metadata"]
     stage_afd_metadata = _build_async_moe_stage_afd_metadata(
         parent_afd_metadata,
-        ubatch_slices,
+        sp_local_ubatch_slices,
         stage_idx,
     )
 
@@ -338,7 +343,7 @@ def _use_async_moe_ubatch_forward_context(
         forward_context.additional_kwargs = stage_kwargs
         forward_context.ubatch_idx = stage_idx
         forward_context.num_ubatches = len(ubatch_slices)
-        forward_context.num_tokens = int(ubatch_slices[stage_idx].num_tokens)
+        forward_context.num_tokens = int(sp_local_ubatch_slices[stage_idx].num_tokens)
         yield
     finally:
         for name, value in saved_attrs.items():
@@ -382,36 +387,6 @@ def _cat_optional_async_moe_stage_outputs(
         ],
         dim=0,
     )
-
-
-def _slice_optional_first_dim(
-    tensor: torch.Tensor | None,
-    token_slice: slice,
-) -> torch.Tensor | None:
-    if tensor is None:
-        return None
-    return tensor[token_slice]
-
-
-def _slice_positions(positions: torch.Tensor, token_slice: slice) -> torch.Tensor:
-    if positions.dim() <= 1:
-        return positions[token_slice]
-    return positions[..., token_slice]
-
-
-def _slice_llama_4_scaling(
-    llama_4_scaling: torch.Tensor | None,
-    token_slice: slice,
-    *,
-    num_tokens: int,
-) -> torch.Tensor | None:
-    if llama_4_scaling is None:
-        return None
-    if llama_4_scaling.shape[0] == num_tokens:
-        return llama_4_scaling[token_slice]
-    if llama_4_scaling.dim() > 1 and llama_4_scaling.shape[1] == num_tokens:
-        return llama_4_scaling[:, token_slice]
-    return llama_4_scaling
 
 
 def _read_forward_context_attr(forward_context: object, name: str) -> object:

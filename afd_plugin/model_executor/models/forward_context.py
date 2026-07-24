@@ -18,7 +18,15 @@ from afd_plugin.connectors import AFDForwardContextMetadata
 ASYNC_MOE_UBATCH_METADATA_KEY: Final[str] = "afd_async_moe_ubatch_metadata"
 
 
-class AsyncMoeUbatchMetadata(TypedDict):
+class _AsyncMoeUbatchMetadataOptional(TypedDict, total=False):
+    # SP-local ubatch slices: when SP shards tokens across TP ranks, slice
+    # model tensors by per-rank local token ranges derived from the global
+    # ubatch slices (an identity mapping when SP is disabled).
+    use_sp_local_ubatch_slices: bool
+    sp_local_ubatch_slices: UBatchSlices
+
+
+class AsyncMoeUbatchMetadata(_AsyncMoeUbatchMetadataOptional):
     attn_metadata: object
     ubatch_slices: UBatchSlices
 

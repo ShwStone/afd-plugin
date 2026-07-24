@@ -475,13 +475,20 @@ def test_npu_attention_metadata_positional_args_and_padded_slices():
     assert normalized[-1].token_slice == slice(4, 8)
 
 
-def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
-    np = pytest.importorskip("numpy")
-    fake_torch = ModuleType("torch")
-    fake_torch.Tensor = object
+@contextmanager
+def _vllm_stubbed_modules(monkeypatch, *, stub_torch=True):
+    """Stub torch/vLLM/vLLM-Ascend so plugin ubatch modules import on CPU."""
+    if stub_torch:
+        fake_torch = ModuleType("torch")
+        fake_torch.Tensor = object
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
     fake_vllm = ModuleType("vllm")
     fake_vllm_config = ModuleType("vllm.config")
     fake_vllm_config.VllmConfig = object
+    fake_vllm_forward_context = ModuleType("vllm.forward_context")
+    fake_vllm_forward_context.DPMetadata = object
+    fake_vllm_forward_context.ForwardContext = object
+    fake_vllm_forward_context.get_forward_context = lambda: None
     fake_vllm_v1 = ModuleType("vllm.v1")
     fake_vllm_worker = ModuleType("vllm.v1.worker")
     fake_vllm_ubatch_utils = ModuleType("vllm.v1.worker.ubatch_utils")
@@ -501,16 +508,25 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
     fake_vllm_ubatch_utils.UBatchSlice = UBatchSlice
     fake_vllm_ubatch_utils.UBatchSlices = list
     fake_vllm_ubatch_utils.check_ubatch_thresholds = lambda *_args, **_kwargs: False
+    fake_distributed = ModuleType("vllm.distributed")
+    fake_parallel_state = ModuleType("vllm.distributed.parallel_state")
+    fake_parallel_state.get_tp_group = lambda: SimpleNamespace(
+        world_size=1,
+        rank_in_group=0,
+    )
+    fake_distributed.parallel_state = fake_parallel_state
     fake_vllm_ascend = ModuleType("vllm_ascend")
+    fake_ascend_utils = ModuleType("vllm_ascend.utils")
+    fake_ascend_utils.enable_sp = lambda *_args, **_kwargs: False
     fake_forward_context = ModuleType("vllm_ascend.ascend_forward_context")
     fake_forward_context.MoECommType = type("MoECommType", (), {})
     fake_attention = ModuleType("vllm_ascend.attention")
     fake_attention_utils = ModuleType("vllm_ascend.attention.utils")
     fake_attention_utils.AscendCommonAttentionMetadata = object
 
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.config", fake_vllm_config)
+    monkeypatch.setitem(sys.modules, "vllm.forward_context", fake_vllm_forward_context)
     monkeypatch.setitem(sys.modules, "vllm.v1", fake_vllm_v1)
     monkeypatch.setitem(sys.modules, "vllm.v1.worker", fake_vllm_worker)
     monkeypatch.setitem(
@@ -518,7 +534,14 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
         "vllm.v1.worker.ubatch_utils",
         fake_vllm_ubatch_utils,
     )
+    monkeypatch.setitem(sys.modules, "vllm.distributed", fake_distributed)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.parallel_state",
+        fake_parallel_state,
+    )
     monkeypatch.setitem(sys.modules, "vllm_ascend", fake_vllm_ascend)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", fake_ascend_utils)
     monkeypatch.setitem(
         sys.modules,
         "vllm_ascend.ascend_forward_context",
@@ -530,11 +553,47 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
         "vllm_ascend.attention.utils",
         fake_attention_utils,
     )
+    yield
 
-    module_name = "afd_plugin.v1.worker.npu.ubatch_utils"
-    original_module = sys.modules.pop(module_name, None)
+
+@contextmanager
+def _fresh_import(*module_names):
+    """Re-import plugin modules so they bind to the stubbed runtime."""
+    originals = {name: sys.modules.pop(name, None) for name in module_names}
     try:
-        ubatch_utils = importlib.import_module(module_name)
+        yield [importlib.import_module(name) for name in module_names]
+    finally:
+        for name in module_names:
+            sys.modules.pop(name, None)
+        for name, module in originals.items():
+            if module is not None:
+                sys.modules[name] = module
+
+
+@contextmanager
+def _ubatch_utils_with_stubbed_runtime(monkeypatch):
+    with (
+        _vllm_stubbed_modules(monkeypatch),
+        _fresh_import("afd_plugin.v1.worker.npu.ubatch_utils") as (module,),
+    ):
+        yield module
+
+
+@contextmanager
+def _ubatch_sp_with_stubbed_runtime(monkeypatch, *, real_torch):
+    with (
+        _vllm_stubbed_modules(monkeypatch, stub_torch=not real_torch),
+        _fresh_import(
+            "afd_plugin.v1.worker.npu.ubatch_utils",
+            "afd_plugin.model_executor.models.npu.ubatch_sp",
+        ) as modules,
+    ):
+        yield modules[1]
+
+
+def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
+    np = pytest.importorskip("numpy")
+    with _ubatch_utils_with_stubbed_runtime(monkeypatch) as ubatch_utils:
         slices = ubatch_utils.create_request_boundary_ubatch_slices(
             np.array([2, 3, 5, 7], dtype=np.int32),
         )
@@ -558,10 +617,306 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
             )
             is None
         )
-    finally:
-        sys.modules.pop(module_name, None)
-        if original_module is not None:
-            sys.modules[module_name] = original_module
+
+
+def test_npu_token_balanced_split_points_align_to_tp_size(monkeypatch):
+    with _ubatch_utils_with_stubbed_runtime(monkeypatch) as ubatch_utils:
+        split_points = ubatch_utils.token_balanced_split_points
+
+        # 100 padded tokens over 2 stages at tp=8: 50 aligned down to 48.
+        assert split_points(100, 2, 8) == [48]
+        # Already aligned split stays put.
+        assert split_points(96, 2, 8) == [48]
+        # Odd totals split as evenly as alignment allows (12/13).
+        assert split_points(25, 2, 2) == [12]
+        # A single stage never splits.
+        assert split_points(100, 1, 8) is None
+        # Fewer tokens than stages cannot split.
+        assert split_points(1, 2, 8) is None
+        # Alignment collapsing the split point disables the split.
+        assert split_points(4, 2, 8) is None
+
+
+def test_npu_create_async_moe_ubatch_slices_topology_selection(monkeypatch):
+    np = pytest.importorskip("numpy")
+    with _ubatch_utils_with_stubbed_runtime(monkeypatch) as ubatch_utils:
+
+        def _config(tp_size=1, pcp_size=1, dcp_size=1):
+            return SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    tensor_parallel_size=tp_size,
+                    prefill_context_parallel_size=pcp_size,
+                    decode_context_parallel_size=dcp_size,
+                ),
+            )
+
+        def _create(
+            config,
+            scheduled,
+            split,
+            num_tokens_padded=None,
+            num_reqs_padded=None,
+        ):
+            return ubatch_utils.create_async_moe_ubatch_slices(
+                config,
+                scheduled,
+                num_tokens=int(scheduled.sum()),
+                num_tokens_padded=num_tokens_padded,
+                num_reqs_padded=num_reqs_padded,
+                num_ubatches=2,
+                split=split,
+            )
+
+        # Skewed lengths with async_moe_split='token' on a capable topology:
+        # token split balances 56/56 where the request-boundary split would
+        # produce 100/12.
+        scheduled = np.array([100, 4, 4, 4], dtype=np.int32)
+        slices, split_mode = _create(
+            _config(tp_size=2),
+            scheduled,
+            "token",
+            num_tokens_padded=112,
+            num_reqs_padded=4,
+        )
+        assert split_mode == ubatch_utils.ASYNC_MOE_SPLIT_TOKEN_BALANCED_TP
+        assert [int(stage.num_tokens) for stage in slices] == [56, 56]
+        # Complete coverage, stable order, no overlap; the straddling long
+        # request appears in both stages' request ranges.
+        assert slices[0].token_slice == slice(0, 56)
+        assert slices[1].token_slice == slice(56, 112)
+        assert slices[0].request_slice == slice(0, 1)
+        assert slices[1].request_slice == slice(0, 4)
+
+        # async_moe_split='request' keeps request boundaries even on a
+        # capable topology (100/12 here).
+        slices, split_mode = _create(_config(tp_size=2), scheduled, "request")
+        assert split_mode == ubatch_utils.ASYNC_MOE_SPLIT_REQUEST_BOUNDARY
+        assert [int(stage.num_tokens) for stage in slices] == [100, 12]
+
+        # async_moe_split='token' on unsupported topologies falls back to
+        # request boundaries (startup validation rejects this combination
+        # before serving).
+        for config in (
+            _config(tp_size=1),
+            _config(tp_size=2, pcp_size=2),
+            _config(tp_size=2, dcp_size=2),
+        ):
+            slices, split_mode = _create(config, scheduled, "token")
+            assert split_mode == ubatch_utils.ASYNC_MOE_SPLIT_REQUEST_BOUNDARY
+            assert [int(stage.num_tokens) for stage in slices] == [100, 12]
+
+
+def test_npu_create_async_moe_ubatch_slices_padded_batches(monkeypatch):
+    np = pytest.importorskip("numpy")
+    with _ubatch_utils_with_stubbed_runtime(monkeypatch) as ubatch_utils:
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=2,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            ),
+        )
+
+        # Normal padding: split points come from the padded total (26 ->
+        # 13 -> aligned 12) and the last stage extends over the pad rows.
+        scheduled = np.array([6, 6, 6, 6], dtype=np.int32)
+        slices, split_mode = ubatch_utils.create_async_moe_ubatch_slices(
+            config,
+            scheduled,
+            num_tokens=24,
+            num_tokens_padded=26,
+            num_reqs_padded=5,
+            num_ubatches=2,
+            split="token",
+        )
+        assert split_mode == ubatch_utils.ASYNC_MOE_SPLIT_TOKEN_BALANCED_TP
+        assert slices[0].request_slice == slice(0, 2)
+        assert slices[0].token_slice == slice(0, 12)
+        assert slices[1].request_slice == slice(2, 5)
+        assert slices[1].token_slice == slice(12, 26)
+
+        # Heavy padding (4 real tokens padded to a 64-token capture size):
+        # the aligned split point lands past the real token count, which
+        # would leave the second stage holding only padding, so the split
+        # falls back to request boundaries.
+        config_tp8 = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=8,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            ),
+        )
+        scheduled = np.array([2, 2], dtype=np.int32)
+        slices, split_mode = ubatch_utils.create_async_moe_ubatch_slices(
+            config_tp8,
+            scheduled,
+            num_tokens=4,
+            num_tokens_padded=64,
+            num_reqs_padded=2,
+            num_ubatches=2,
+            split="token",
+        )
+        assert split_mode == ubatch_utils.ASYNC_MOE_SPLIT_REQUEST_BOUNDARY
+        assert [int(stage.num_tokens) for stage in slices] == [2, 2]
+
+        # Odd token counts still cover every token exactly once.
+        scheduled = np.array([13, 12], dtype=np.int32)
+        slices, split_mode = ubatch_utils.create_async_moe_ubatch_slices(
+            config,
+            scheduled,
+            num_tokens=25,
+            num_tokens_padded=26,
+            num_reqs_padded=2,
+            num_ubatches=2,
+            split="token",
+        )
+        assert split_mode == ubatch_utils.ASYNC_MOE_SPLIT_TOKEN_BALANCED_TP
+        assert slices[0].token_slice == slice(0, 12)
+        assert slices[1].token_slice == slice(12, 26)
+        assert [int(stage.num_tokens) for stage in slices] == [12, 14]
+
+
+def test_npu_sp_local_token_count_rounds_up(monkeypatch):
+    with _ubatch_utils_with_stubbed_runtime(monkeypatch) as ubatch_utils:
+        assert ubatch_utils.sp_local_token_count(10, 2) == 5
+        assert ubatch_utils.sp_local_token_count(7, 4) == 2
+        assert ubatch_utils.sp_local_token_count(8, 8) == 1
+
+
+def test_npu_sp_local_ubatch_slices_use_tp_local_ranges(monkeypatch):
+    with _ubatch_utils_with_stubbed_runtime(monkeypatch) as ubatch_utils:
+        parallel_state = sys.modules["vllm.distributed.parallel_state"]
+        ascend_utils = sys.modules["vllm_ascend.utils"]
+        ubatch_slices = [
+            ubatch_utils.UBatchSlice(slice(0, 2), slice(0, 10)),
+            ubatch_utils.UBatchSlice(slice(2, 4), slice(10, 16)),
+        ]
+
+        # 8 local rows for 16 global tokens at tp=2 triggers the SP mapping.
+        hidden_states = SimpleNamespace(shape=(8, 1))
+        monkeypatch.setattr(ascend_utils, "enable_sp", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(
+            parallel_state,
+            "get_tp_group",
+            lambda: SimpleNamespace(world_size=2, rank_in_group=0),
+        )
+
+        local_slices = ubatch_utils.build_sp_local_ubatch_slices_for_current_rank(
+            hidden_states,
+            ubatch_slices,
+        )
+
+        assert [tensor_slice.token_slice for tensor_slice in local_slices] == [
+            slice(0, 5),
+            slice(5, 8),
+        ]
+        assert [int(tensor_slice.num_tokens) for tensor_slice in local_slices] == [5, 3]
+        # Request ranges are carried over unchanged.
+        assert [tensor_slice.request_slice for tensor_slice in local_slices] == [
+            slice(0, 2),
+            slice(2, 4),
+        ]
+
+        # Without SP the global slices pass through unchanged.
+        monkeypatch.setattr(ascend_utils, "enable_sp", lambda *_args, **_kwargs: False)
+        assert (
+            ubatch_utils.build_sp_local_ubatch_slices_for_current_rank(
+                hidden_states,
+                ubatch_slices,
+            )
+            is ubatch_slices
+        )
+
+        # A rank holding the full token range never maps to local slices.
+        monkeypatch.setattr(ascend_utils, "enable_sp", lambda *_args, **_kwargs: True)
+        full_hidden_states = SimpleNamespace(shape=(16, 1))
+        assert (
+            ubatch_utils.build_sp_local_ubatch_slices_for_current_rank(
+                full_hidden_states,
+                ubatch_slices,
+            )
+            is ubatch_slices
+        )
+
+
+def test_ubatch_sp_stage_inputs_use_sp_local_ranges(monkeypatch):
+    torch = pytest.importorskip("torch")
+    with _ubatch_sp_with_stubbed_runtime(monkeypatch, real_torch=True) as ubatch_sp:
+        ubatch_utils = sys.modules["afd_plugin.v1.worker.npu.ubatch_utils"]
+        parallel_state = sys.modules["vllm.distributed.parallel_state"]
+        ascend_utils = sys.modules["vllm_ascend.utils"]
+        monkeypatch.setattr(ascend_utils, "enable_sp", lambda *_args, **_kwargs: True)
+        ubatch_slices = [
+            ubatch_utils.UBatchSlice(slice(0, 2), slice(0, 10)),
+            ubatch_utils.UBatchSlice(slice(2, 4), slice(10, 16)),
+        ]
+
+        # 8 local rows for 16 global tokens at tp=2.
+        hidden_states = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+        residual = hidden_states + 100
+        positions = torch.arange(16)
+
+        for tp_rank, expected_stage_positions in (
+            (0, [[0, 1, 2, 3, 4], [10, 11, 12]]),
+            (1, [[5, 6, 7, 8, 9], [13, 14, 15]]),
+        ):
+            monkeypatch.setattr(
+                parallel_state,
+                "get_tp_group",
+                lambda rank=tp_rank: SimpleNamespace(
+                    world_size=2,
+                    rank_in_group=rank,
+                ),
+            )
+            (
+                stage_hidden_states,
+                stage_residual,
+                stage_positions,
+                stage_llama_4_scaling,
+                sp_local_ubatch_slices,
+            ) = ubatch_sp.build_async_moe_stage_inputs(
+                hidden_states=hidden_states,
+                residual=residual,
+                positions=positions,
+                llama_4_scaling=None,
+                ubatch_slices=ubatch_slices,
+                use_sp_local_ubatch_slices=True,
+            )
+
+            assert [
+                tensor_slice.token_slice for tensor_slice in sp_local_ubatch_slices
+            ] == [
+                slice(0, 5),
+                slice(5, 8),
+            ]
+            assert [int(stage.shape[0]) for stage in stage_hidden_states] == [5, 3]
+            assert [int(stage.shape[0]) for stage in stage_residual] == [5, 3]
+            assert [stage.tolist() for stage in stage_positions] == (
+                expected_stage_positions
+            )
+            assert stage_llama_4_scaling == [None, None]
+
+        # use_sp_local_ubatch_slices=False keeps the global slicing path.
+        full_hidden_states = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+        (
+            stage_hidden_states,
+            stage_residual,
+            stage_positions,
+            _,
+            sp_local_ubatch_slices,
+        ) = ubatch_sp.build_async_moe_stage_inputs(
+            hidden_states=full_hidden_states,
+            residual=None,
+            positions=positions,
+            llama_4_scaling=None,
+            ubatch_slices=ubatch_slices,
+            use_sp_local_ubatch_slices=False,
+        )
+        assert sp_local_ubatch_slices is ubatch_slices
+        assert [int(stage.shape[0]) for stage in stage_hidden_states] == [10, 6]
+        assert stage_residual == [None, None]
+        assert stage_positions[0].tolist() == list(range(10))
+        assert stage_positions[1].tolist() == list(range(10, 16))
 
 
 def test_npu_create_ascend_forward_context_marks_current_ubatch(monkeypatch):
@@ -1181,6 +1536,20 @@ def test_npu_async_feature_validation_allows_dynamic_quant_zero_or_one():
         )
 
 
+def test_npu_async_moe_ubatching_validation_suggests_token_split(caplog):
+    with caplog.at_level(logging.WARNING):
+        fail_if_unsupported_npu_afd_features(
+            _vllm_config(
+                connector="CAMAsyncAFDConnector",
+                async_dp=True,
+                compute_gate_on_attention=True,
+                tensor_parallel_size=2,
+                extra_config={"async_moe_ubatching": True},
+            ),
+        )
+    assert "async_moe_split='token'" in caplog.text
+
+
 def test_npu_async_moe_ubatching_validation_requires_supported_shape():
     fail_if_unsupported_npu_afd_features(
         _vllm_config(
@@ -1215,7 +1584,7 @@ def test_npu_async_moe_ubatching_validation_requires_supported_shape():
             ),
         )
 
-    with pytest.raises(RuntimeError, match="request-boundary"):
+    with pytest.raises(RuntimeError, match="non-PCP DP+TP/SP"):
         fail_if_unsupported_npu_afd_features(
             _vllm_config(
                 connector="CAMAsyncAFDConnector",
@@ -1227,6 +1596,33 @@ def test_npu_async_moe_ubatching_validation_requires_supported_shape():
                 },
             ),
         )
+
+    with pytest.raises(RuntimeError, match="must be 'request' or 'token'"):
+        fail_if_unsupported_npu_afd_features(
+            _vllm_config(
+                connector="CAMAsyncAFDConnector",
+                async_dp=True,
+                compute_gate_on_attention=True,
+                extra_config={
+                    "async_moe_ubatching": True,
+                    "async_moe_split": "layer",
+                },
+            ),
+        )
+
+    # async_moe_split="token" is accepted on non-PCP DP+TP/SP topologies.
+    fail_if_unsupported_npu_afd_features(
+        _vllm_config(
+            connector="CAMAsyncAFDConnector",
+            async_dp=True,
+            compute_gate_on_attention=True,
+            tensor_parallel_size=2,
+            extra_config={
+                "async_moe_ubatching": True,
+                "async_moe_split": "token",
+            },
+        ),
+    )
 
     fail_if_unsupported_npu_afd_features(
         _vllm_config(

@@ -65,6 +65,7 @@ AFD_ASYNC_CAM_GROUP_NAME = "afd_async_cam"
 CAM_COMM_ID = 0
 ATTN_RANKS_PER_DP_CONFIG_KEY = "attn_ranks_per_dp"
 ASYNC_MOE_REQUEST_SPLIT = "request"
+ASYNC_MOE_TOKEN_SPLIT = "token"
 
 _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -88,7 +89,9 @@ class AFDAsyncExtraInfo(ConnectorExtraInfo):
         attn_ranks_per_dp: Number of Attention ranks in each data-parallel group.
         async_moe_ubatching: Whether request-boundary async MoE ubatching is used.
         async_moe_num_ubatches: Number of stages used by async MoE ubatching.
-        async_moe_split: Boundary at which async MoE work is split.
+        async_moe_split: Boundary at which async MoE work is split: "request"
+            for request boundaries, "token" for TP-aligned token-balanced
+            split points (non-PCP DP+TP/SP topologies only).
     """
 
     dynamic_quant: int = 0

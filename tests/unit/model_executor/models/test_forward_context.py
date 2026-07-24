@@ -191,7 +191,8 @@ def test_deepseek_async_moe_ubatching_runs_attention_inside_stage_context():
     assert "dense_end_layer = min(model.end_layer, first_moe_layer)" in (
         async_ubatch_forward
     )
-    assert "stage_hidden_states = [" in async_ubatch_forward
+    assert "stage_hidden_states," in async_ubatch_forward
+    assert "build_async_moe_stage_inputs(" in async_ubatch_forward
     assert (
         "moe_layers = list(islice(model.layers, moe_start_layer, model.end_layer))"
         in async_ubatch_forward
