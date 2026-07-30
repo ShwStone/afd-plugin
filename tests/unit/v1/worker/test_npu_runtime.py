@@ -5,6 +5,7 @@ import logging
 import sys
 import threading
 from collections import deque
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from types import ModuleType, SimpleNamespace
 
@@ -25,6 +26,29 @@ from afd_plugin.connectors import (
     AFDTransferMetadata,
     AFDTransferState,
 )
+
+
+@contextmanager
+def _temporarily_reimport_module(module_name: str) -> Iterator[ModuleType]:
+    """Reimport a module without leaking it through its parent package."""
+    package_name, _, module_attribute = module_name.rpartition(".")
+    package = importlib.import_module(package_name)
+    missing_attribute = object()
+    original_package_attribute = package.__dict__.get(
+        module_attribute,
+        missing_attribute,
+    )
+    original_module = sys.modules.pop(module_name, None)
+    try:
+        yield importlib.import_module(module_name)
+    finally:
+        sys.modules.pop(module_name, None)
+        if original_module is not None:
+            sys.modules[module_name] = original_module
+        if original_package_attribute is missing_attribute:
+            package.__dict__.pop(module_attribute, None)
+        else:
+            package.__dict__[module_attribute] = original_package_attribute
 
 
 def _ffn_payload(hidden_states, metadata, states=None):
@@ -532,10 +556,9 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
         fake_attention_utils,
     )
 
-    module_name = "afd_plugin.v1.worker.npu.ubatch_utils"
-    original_module = sys.modules.pop(module_name, None)
-    try:
-        ubatch_utils = importlib.import_module(module_name)
+    with _temporarily_reimport_module(
+        "afd_plugin.v1.worker.npu.ubatch_utils",
+    ) as ubatch_utils:
         slices = ubatch_utils.create_request_boundary_ubatch_slices(
             np.array([2, 3, 5, 7], dtype=np.int32),
         )
@@ -559,10 +582,6 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
             )
             is None
         )
-    finally:
-        sys.modules.pop(module_name, None)
-        if original_module is not None:
-            sys.modules[module_name] = original_module
 
 
 def test_npu_async_moe_token_stage_plan_handles_single_request_and_padding():
@@ -1820,10 +1839,9 @@ def test_npu_ubatch_allows_mc2_comm_when_thresholds_are_met(monkeypatch):
         fake_attention_utils,
     )
 
-    module_name = "afd_plugin.v1.worker.npu.ubatch_utils"
-    original_module = sys.modules.pop(module_name, None)
-    try:
-        ubatch_utils = importlib.import_module(module_name)
+    with _temporarily_reimport_module(
+        "afd_plugin.v1.worker.npu.ubatch_utils",
+    ) as ubatch_utils:
         config = _vllm_config(
             enable_dbo=True,
             use_ubatching=True,
@@ -1847,10 +1865,6 @@ def test_npu_ubatch_allows_mc2_comm_when_thresholds_are_met(monkeypatch):
             vllm_config=config,
             moe_comm_type=ubatch_utils.MoECommType.FUSED_MC2,
         )
-    finally:
-        sys.modules.pop(module_name, None)
-        if original_module is not None:
-            sys.modules[module_name] = original_module
 
 
 def _tokens(dp_metadata):
