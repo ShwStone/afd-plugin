@@ -204,15 +204,15 @@ The opt-in
 `tests/e2e/accuracy/test_gsm8k_npu_async_cam.py::test_gsm8k_lm_eval_async_cam_dp3tp2_ep2`
 test covers one parameterized DP3TP2 Attention + DP2TP1/EP2 FFN matrix:
 
-- token and request split modes;
+- token and request split modes when async MoE ubatching is enabled;
 - Attention FlashComm1/SP enabled and disabled;
-- AFD-managed async MoE ubatching enabled and disabled.
+- one non-ubatched case for each SP setting.
 
-This produces eight cases. When ubatching is disabled, the split setting is
-inactive, so the token and request cases intentionally exercise the same
-non-ubatched runtime path. Each case checks the configured GSM8K accuracy
-threshold independently; the suite does not launch a second deployment for an
-automatic baseline comparison.
+This produces six distinct cases. When ubatching is disabled,
+`async_moe_split` is not sent to the server because it has no runtime effect.
+Each case checks the configured GSM8K accuracy threshold independently; the
+suite does not launch a second deployment for an automatic baseline
+comparison.
 
 Run the full matrix with:
 

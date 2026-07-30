@@ -171,16 +171,19 @@ def _run_gsm8k_async_cam(
 @pytest.mark.e2e
 @pytest.mark.eval
 @pytest.mark.slow
-@pytest.mark.parametrize("split", ("token", "request"))
 @pytest.mark.parametrize(
     "enable_attention_sp",
     (True, False),
     ids=("sp", "no-sp"),
 )
 @pytest.mark.parametrize(
-    "async_moe_ubatching",
-    (True, False),
-    ids=("ubatch", "no-ubatch"),
+    ("split", "async_moe_ubatching"),
+    (
+        ("token", True),
+        ("request", True),
+        ("request", False),
+    ),
+    ids=("token-ubatch", "request-ubatch", "no-ubatch"),
 )
 @pytest.mark.skipif(
     os.environ.get("AFD_NPU_ASYNC_CAM_RUN_DP3TP2") != "1",
@@ -197,7 +200,7 @@ def test_gsm8k_lm_eval_async_cam_dp3tp2_ep2(
     enable_attention_sp: bool,
     async_moe_ubatching: bool,
 ) -> None:
-    """Check the split, SP, and ubatching matrix on DP3TP2+DP2TP1/EP2."""
+    """Check the six distinct SP and async-MoE modes on DP3TP2+DP2TP1/EP2."""
 
     npus = _npu_list()
     if len(npus) < 8:

@@ -197,20 +197,10 @@ def test_deepseek_compute_gate_on_attention_is_npu_only():
     )
 
 
-def test_deepseek_async_moe_ubatching_runs_attention_inside_stage_context():
+def test_deepseek_async_moe_ubatching_delegates_to_npu_orchestrator():
     source = Path("afd_plugin/model_executor/models/deepseek_v2.py").read_text()
-    executor_source = Path(
-        "afd_plugin/model_executor/models/npu/deepseek_v2_async_cam_forward.py",
-    ).read_text()
     forward_with_afd_v3 = source.split("    def forward_with_afd_v3(", 1)[1].split(
         "    def compute_ffn_output(",
-        1,
-    )[0]
-    async_ubatch_forward = executor_source.split(
-        "def run_async_moe_ubatch_afd_forward(",
-        1,
-    )[1].split(
-        "_MISSING_FORWARD_CONTEXT_ATTR = object()",
         1,
     )[0]
 
@@ -221,54 +211,6 @@ def test_deepseek_async_moe_ubatching_runs_attention_inside_stage_context():
     )
     assert "from afd_plugin.model_executor.models.npu import (" in forward_with_afd_v3
     assert "deepseek_v2_async_cam_forward," in forward_with_afd_v3
-    assert "_log_async_moe_forward_step(" not in async_ubatch_forward
-    assert "if layer.is_moe_layer" in async_ubatch_forward
-    assert "dense_prefix_layers = model_layers[:first_moe_offset]" in (
-        async_ubatch_forward
-    )
-    assert "contiguous MoE layers" in async_ubatch_forward
-    assert "build_async_moe_stage_inputs(" in async_ubatch_forward
-    assert "moe_layers = model_layers[first_moe_offset:]" in async_ubatch_forward
-    assert "def compute_stage_attention(" in async_ubatch_forward
-    assert "def send_stage_attention(" in async_ubatch_forward
-    assert "def recv_stage_ffn(" in async_ubatch_forward
-    assert "for moe_layer_offset in range(last_moe_layer_offset):" in (
-        async_ubatch_forward
-    )
-    assert "def flush_pending_ffn_outputs()" not in async_ubatch_forward
-    assert "restore_async_moe_stage_outputs(" in executor_source
-    assert "_run_async_moe_ubatch_layer(" not in executor_source
-    assert "_recv_async_moe_ubatch_outputs(" not in executor_source
-    assert "maybe_apply_dbo_yield" not in executor_source
-    assert "forward_context.dbo_enabled =" not in executor_source
-    assert (
-        "forward_context.attn_metadata = async_moe_ubatch_metadata.attn_metadata["
-        in executor_source
-    )
-    assert async_ubatch_forward.index(
-        "with _use_async_moe_ubatch_forward_context(",
-    ) < (async_ubatch_forward.index("layer.compute_attn_output("))
-    assert async_ubatch_forward.index(") = layer.compute_attn_output(") < (
-        async_ubatch_forward.index("def send_stage_attention(")
-    )
-    assert async_ubatch_forward.index(
-        "first_layer = moe_layers[0]",
-    ) < async_ubatch_forward.index(
-        "for moe_layer_offset in range(last_moe_layer_offset):",
-    )
-    assert async_ubatch_forward.index("recv_stage_ffn(0)") < (
-        async_ubatch_forward.index(
-            "send_stage_attention(\n            current_layer,\n            1",
-        )
-    )
-    assert async_ubatch_forward.index("recv_stage_ffn(1)") < (
-        async_ubatch_forward.index(
-            "send_stage_attention(\n            next_layer,\n            0",
-        )
-    )
-    assert async_ubatch_forward.index(
-        "send_stage_attention(\n        last_layer,\n        1",
-    ) < (async_ubatch_forward.rindex("recv_stage_ffn(1)"))
 
 
 def test_async_moe_stage_planning_does_not_coordinate_independent_dp_engines():

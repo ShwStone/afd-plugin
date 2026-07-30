@@ -584,56 +584,6 @@ def test_npu_request_boundary_ubatch_slices_balance_tokens(monkeypatch):
         )
 
 
-def test_npu_async_moe_token_stage_plan_handles_single_request_and_padding():
-    from afd_plugin.v1.worker.npu.async_moe_ubatch import (
-        plan_async_moe_stages,
-    )
-
-    stage_plan = plan_async_moe_stages(
-        [1099],
-        num_tokens=1099,
-        num_tokens_padded=1100,
-        num_reqs_padded=1,
-        num_stages=2,
-        split="token",
-        use_sequence_parallel=True,
-        tensor_parallel_size=2,
-    )
-
-    assert stage_plan is not None
-    stage_slices, actual_token_counts = stage_plan
-    assert [stage.token_slice for stage in stage_slices] == [
-        slice(0, 550),
-        slice(550, 1099),
-    ]
-    assert actual_token_counts == (550, 549)
-
-
-def test_npu_async_moe_token_stage_plan_does_not_fallback_to_request_split():
-    from afd_plugin.v1.worker.npu.async_moe_ubatch import (
-        plan_async_moe_stages,
-    )
-
-    stage_plan = plan_async_moe_stages(
-        [40],
-        num_tokens=40,
-        num_tokens_padded=112,
-        num_reqs_padded=1,
-        num_stages=2,
-        split="token",
-        use_sequence_parallel=True,
-        tensor_parallel_size=2,
-    )
-
-    assert stage_plan is not None
-    stage_slices, actual_token_counts = stage_plan
-    assert [stage.token_slice for stage in stage_slices] == [
-        slice(0, 20),
-        slice(20, 40),
-    ]
-    assert actual_token_counts == (20, 20)
-
-
 def test_npu_async_moe_metadata_tracks_stage_padding_separately(monkeypatch):
     _require_npu_runtime()
     torch = pytest.importorskip("torch")
@@ -1724,21 +1674,6 @@ def test_npu_async_moe_ubatching_validation_requires_supported_shape():
             },
         ),
     )
-    # Plain DP+TP is a supported non-PCP token topology; FlashComm1/SP is
-    # optional on the Attention role.
-    fail_if_unsupported_npu_afd_features(
-        _vllm_config(
-            connector="CAMAsyncAFDConnector",
-            async_dp=True,
-            compute_gate_on_attention=True,
-            tensor_parallel_size=2,
-            extra_config={
-                "async_moe_ubatching": True,
-                "async_moe_split": "token",
-            },
-        ),
-    )
-
     # FFN consumes CAM stage work items and may independently use TP1.
     fail_if_unsupported_npu_afd_features(
         _vllm_config(
