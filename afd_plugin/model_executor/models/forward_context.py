@@ -6,21 +6,81 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Final, TypedDict
+from typing import Any, Final
 
 import vllm.forward_context as forward_context_module
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.v1.worker.ubatch_utils import UBatchSlices
 
+from afd_plugin.async_moe import AsyncMoeStage
 from afd_plugin.connectors import AFDForwardContextMetadata
 
 ASYNC_MOE_UBATCH_METADATA_KEY: Final[str] = "afd_async_moe_ubatch_metadata"
 
 
-class AsyncMoeUbatchMetadata(TypedDict):
-    attn_metadata: object
-    ubatch_slices: UBatchSlices
+@dataclass(frozen=True)
+class AsyncMoeUbatchMetadata:
+    """Immutable execution plan for one two-stage Async CAM model forward.
+
+    Each stage's token slice uses the parent real-token coordinate space, while
+    ``stage.num_tokens`` includes its minimum physical padding. Under sequence
+    parallelism each physical stage is divided evenly across TP ranks by the
+    model-side layout helper. ``parent_input_tokens`` records the original
+    padded layout restored after both stages.
+    """
+
+    attn_metadata: list[dict[str, object]]
+    ubatch_slices: tuple[AsyncMoeStage, ...]
+    parent_input_tokens: int
+    use_sequence_parallel: bool
+
+    @property
+    def stage_actual_token_counts(self) -> tuple[int, ...]:
+        return tuple(stage.actual_tokens for stage in self.ubatch_slices)
+
+    @property
+    def num_parent_input_tokens(self) -> int:
+        return self.parent_input_tokens
+
+    def __post_init__(self) -> None:
+        num_stages = len(self.ubatch_slices)
+        if not num_stages or len(self.attn_metadata) != num_stages:
+            raise ValueError(
+                "Async CAM execution-plan fields must describe the same "
+                f"non-empty stage count: attention={len(self.attn_metadata)}, "
+                f"slices={num_stages}",
+            )
+
+        expected_token_start = 0
+        for stage_slice, actual_tokens in zip(
+            self.ubatch_slices,
+            self.stage_actual_token_counts,
+            strict=True,
+        ):
+            token_slice = stage_slice.token_slice
+            token_start = int(token_slice.start)
+            token_stop = int(token_slice.stop)
+            actual_token_extent = token_stop - token_start
+            input_tokens = int(stage_slice.num_tokens)
+            if token_start != expected_token_start or actual_token_extent <= 0:
+                raise ValueError(
+                    "Async CAM stage token slices must be contiguous, ordered, "
+                    f"and non-empty: token_slice={token_slice}, "
+                    f"expected_start={expected_token_start}",
+                )
+            if not 0 < int(actual_tokens) <= input_tokens:
+                raise ValueError(
+                    "Async CAM stage actual-token count must fit its physical "
+                    f"extent: actual={actual_tokens}, input={input_tokens}",
+                )
+            expected_token_start = token_stop
+        if self.num_parent_input_tokens < expected_token_start:
+            raise ValueError(
+                "Async CAM parent input extent must cover every real token: "
+                f"parent_input_tokens={self.num_parent_input_tokens}, "
+                f"actual_tokens={expected_token_start}",
+            )
 
 
 def get_afd_metadata_from_forward_context(
@@ -90,6 +150,7 @@ def use_afd_metadata_provider(provider: Any) -> Iterator[None]:
 
 __all__ = [
     "ASYNC_MOE_UBATCH_METADATA_KEY",
+    "AsyncMoeUbatchMetadata",
     "get_afd_metadata_from_forward_context",
     "get_async_moe_ubatch_metadata_from_forward_context",
     "use_afd_metadata_provider",
