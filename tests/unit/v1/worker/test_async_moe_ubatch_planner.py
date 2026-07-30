@@ -80,98 +80,98 @@ def test_token_stage_plan_rebuilds_request_ranges_when_split_inside_request():
     assert stages[1].token_slice == slice(52, 104)
 
 
-def test_request_stage_plan_preserves_request_boundaries_for_pcp_policy():
+@pytest.mark.parametrize(
+    (
+        "scheduled_tokens",
+        "use_sequence_parallel",
+        "tensor_parallel_size",
+        "expected_request_slices",
+        "expected_token_slices",
+        "expected_actual_tokens",
+        "expected_physical_tokens",
+    ),
+    [
+        (
+            [824, 846, 16],
+            False,
+            1,
+            [slice(0, 1), slice(1, 3)],
+            [slice(0, 824), slice(824, 1686)],
+            (824, 862),
+            (824, 862),
+        ),
+        (
+            [5, 6, 7],
+            True,
+            2,
+            [slice(0, 2), slice(2, 3)],
+            [slice(0, 11), slice(11, 18)],
+            (11, 7),
+            (12, 8),
+        ),
+        ([18], True, 2, None, None, None, None),
+    ],
+    ids=("request-boundary", "flashcomm-aligned", "single-request"),
+)
+def test_request_stage_plan(
+    scheduled_tokens,
+    use_sequence_parallel,
+    tensor_parallel_size,
+    expected_request_slices,
+    expected_token_slices,
+    expected_actual_tokens,
+    expected_physical_tokens,
+):
+    num_tokens = sum(scheduled_tokens)
     stage_plan = plan_async_moe_stages(
-        [824, 846, 16],
-        num_tokens=1686,
-        num_tokens_padded=1686,
-        num_reqs_padded=3,
+        scheduled_tokens,
+        num_tokens=num_tokens,
+        num_tokens_padded=num_tokens,
+        num_reqs_padded=len(scheduled_tokens),
         num_stages=2,
         split="request",
-        use_sequence_parallel=False,
-        tensor_parallel_size=1,
+        use_sequence_parallel=use_sequence_parallel,
+        tensor_parallel_size=tensor_parallel_size,
     )
 
+    if expected_request_slices is None:
+        assert stage_plan is None
+        return
     assert stage_plan is not None
     stages, actual_token_counts = stage_plan
-    assert [stage.request_slice for stage in stages] == [
-        slice(0, 1),
-        slice(1, 3),
-    ]
-    assert [stage.token_slice for stage in stages] == [
-        slice(0, 824),
-        slice(824, 1686),
-    ]
-    assert actual_token_counts == (824, 862)
+    assert [stage.request_slice for stage in stages] == expected_request_slices
+    assert [stage.token_slice for stage in stages] == expected_token_slices
+    assert actual_token_counts == expected_actual_tokens
+    assert tuple(stage.num_tokens for stage in stages) == expected_physical_tokens
 
 
-def test_request_stage_plan_aligns_each_flashcomm_stage_to_tp():
-    stage_plan = plan_async_moe_stages(
-        [5, 6, 7],
-        num_tokens=18,
-        num_tokens_padded=18,
-        num_reqs_padded=3,
-        num_stages=2,
-        split="request",
-        use_sequence_parallel=True,
-        tensor_parallel_size=2,
-    )
-
-    assert stage_plan is not None
-    stages, actual_token_counts = stage_plan
-    assert [stage.request_slice for stage in stages] == [
-        slice(0, 2),
-        slice(2, 3),
-    ]
-    assert [stage.token_slice for stage in stages] == [
-        slice(0, 11),
-        slice(11, 18),
-    ]
-    assert actual_token_counts == (11, 7)
-    assert tuple(stage.num_tokens for stage in stages) == (12, 8)
-
-
-def test_request_stage_plan_needs_two_scheduled_requests_with_flashcomm():
-    assert (
+@pytest.mark.parametrize(
+    ("scheduled_tokens", "num_tokens", "num_stages", "error"),
+    [
+        ([4, 4], 8, 3, "exactly two"),
+        ([4, 3], 8, 2, "do not match"),
+    ],
+)
+def test_stage_plan_rejects_invalid_inputs(
+    scheduled_tokens,
+    num_tokens,
+    num_stages,
+    error,
+):
+    with pytest.raises(ValueError, match=error):
         plan_async_moe_stages(
-            [18],
-            num_tokens=18,
-            num_tokens_padded=18,
-            num_reqs_padded=1,
-            num_stages=2,
-            split="request",
-            use_sequence_parallel=True,
-            tensor_parallel_size=2,
-        )
-        is None
-    )
-
-
-def test_token_stage_plan_rejects_invalid_inputs_and_handles_minimal_batch():
-    with pytest.raises(ValueError, match="exactly two"):
-        plan_async_moe_stages(
-            [4, 4],
-            num_tokens=8,
+            scheduled_tokens,
+            num_tokens=num_tokens,
             num_tokens_padded=8,
             num_reqs_padded=2,
-            num_stages=3,
+            num_stages=num_stages,
             split="token",
             use_sequence_parallel=True,
             tensor_parallel_size=2,
         )
 
-    with pytest.raises(ValueError, match="do not match"):
-        plan_async_moe_stages(
-            [4, 3],
-            num_tokens=8,
-            num_tokens_padded=8,
-            num_reqs_padded=2,
-            num_stages=2,
-            split="token",
-            use_sequence_parallel=True,
-            tensor_parallel_size=2,
-        )
 
+def test_token_stage_plan_handles_minimal_batch():
     assert (
         plan_async_moe_stages(
             [2],

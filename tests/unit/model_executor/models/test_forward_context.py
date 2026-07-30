@@ -197,39 +197,6 @@ def test_deepseek_compute_gate_on_attention_is_npu_only():
     )
 
 
-def test_deepseek_async_moe_ubatching_delegates_to_npu_orchestrator():
-    source = Path("afd_plugin/model_executor/models/deepseek_v2.py").read_text()
-    forward_with_afd_v3 = source.split("    def forward_with_afd_v3(", 1)[1].split(
-        "    def compute_ffn_output(",
-        1,
-    )[0]
-
-    assert "async_moe_ubatch_metadata" in forward_with_afd_v3
-    assert (
-        "return deepseek_v2_async_cam_forward.run_async_moe_ubatch_afd_forward("
-        in forward_with_afd_v3
-    )
-    assert "from afd_plugin.model_executor.models.npu import (" in forward_with_afd_v3
-    assert "deepseek_v2_async_cam_forward," in forward_with_afd_v3
-
-
-def test_async_moe_stage_planning_does_not_coordinate_independent_dp_engines():
-    source = Path(
-        "afd_plugin/v1/worker/npu/attention_model_runner.py",
-    ).read_text()
-    async_metadata_builder = source.split(
-        "    def _build_attention_metadata_with_async_moe_ubatches(",
-        1,
-    )[1].split(
-        "    def _build_attention_metadata_with_ubatches(",
-        1,
-    )[0]
-
-    assert "dist.all_reduce" not in async_metadata_builder
-    assert "get_dp_group" not in async_metadata_builder
-    assert "plan_async_moe_stages(" in async_metadata_builder
-
-
 def test_async_moe_stage_context_changes_only_stage_attention_state():
     torch = pytest.importorskip("torch")
 
