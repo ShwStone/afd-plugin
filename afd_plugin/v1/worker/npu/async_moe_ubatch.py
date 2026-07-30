@@ -55,12 +55,9 @@ def plan_async_moe_stages(
             range(1, len(scheduled_tokens)),
             key=lambda request_index: (
                 abs(
-                    cumulative_tokens[request_index] * ASYNC_MOE_NUM_STAGES
-                    - num_tokens
+                    cumulative_tokens[request_index] * ASYNC_MOE_NUM_STAGES - num_tokens
                 ),
-                abs(
-                    request_index * ASYNC_MOE_NUM_STAGES - len(scheduled_tokens)
-                ),
+                abs(request_index * ASYNC_MOE_NUM_STAGES - len(scheduled_tokens)),
             ),
         )
         split_token = cumulative_tokens[split_request]
