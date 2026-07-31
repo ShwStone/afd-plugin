@@ -9,6 +9,9 @@ This guide describes the supported deployment shape, configuration contract,
 rank mapping, data flow, startup requirements, and current limitations. The
 [DeepSeek-V3.2 recipe](../../recipe/npu/CAMAsyncAFDConnector/deepseek_v3_2/README.md)
 contains the complete validated multi-node launch commands.
+The
+[prefill performance experiment](PREFILL_PERFORMANCE_EXPERIMENT.md)
+defines the reproducible DP+TP+SP versus AFD benchmark and profile workflow.
 
 ## When to use this connector
 
