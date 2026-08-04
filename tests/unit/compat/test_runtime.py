@@ -181,3 +181,90 @@ def test_npu_afd_config_patch_restores_dbo_for_afd(monkeypatch):
     assert NPUPlatform._fix_incompatible_config(inactive_config) == "fixed"
     assert inactive_config.parallel_config.enable_dbo is False
     assert inactive_config.parallel_config.use_ubatching is False
+
+
+def test_npu_afd_attention_flashcomm1_keeps_runtime_ep_disabled(monkeypatch):
+    fake_package = ModuleType("vllm_ascend")
+    fake_package.__path__ = []
+    fake_platform = ModuleType("vllm_ascend.platform")
+    fake_utils = ModuleType("vllm_ascend.utils")
+    flashcomm1_enabled = True
+    observed_ep_values = []
+
+    class NPUPlatform:
+        @classmethod
+        def check_and_update_config(cls, vllm_config):
+            observed_ep_values.append(
+                vllm_config.parallel_config.enable_expert_parallel,
+            )
+
+        @staticmethod
+        def _fix_incompatible_config(vllm_config):
+            return None
+
+    def enable_sp(vllm_config):
+        return flashcomm1_enabled
+
+    def afd_vllm_config(
+        *,
+        role,
+        enable_expert_parallel,
+        connector="CAMAsyncAFDConnector",
+    ):
+        return SimpleNamespace(
+            additional_config={
+                "afd": {
+                    "role": role,
+                    "connector": connector,
+                },
+            },
+            parallel_config=SimpleNamespace(
+                enable_expert_parallel=enable_expert_parallel,
+            ),
+        )
+
+    fake_platform.NPUPlatform = NPUPlatform
+    fake_utils.enable_sp = enable_sp
+    monkeypatch.setitem(sys.modules, "vllm_ascend", fake_package)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.platform", fake_platform)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.utils", fake_utils)
+    monkeypatch.setattr(ascend_runtime, "_PATCHES_APPLIED", False)
+
+    ascend_runtime.apply_afd_ascend_patches_if_needed()
+
+    attention_config_without_ep = afd_vllm_config(
+        role="attention",
+        enable_expert_parallel=False,
+    )
+    NPUPlatform.check_and_update_config(attention_config_without_ep)
+
+    assert observed_ep_values == [True]
+    assert attention_config_without_ep.parallel_config.enable_expert_parallel is False
+
+    attention_config_with_ep = afd_vllm_config(
+        role="attention",
+        enable_expert_parallel=True,
+    )
+    NPUPlatform.check_and_update_config(attention_config_with_ep)
+
+    assert observed_ep_values == [True, True]
+    assert attention_config_with_ep.parallel_config.enable_expert_parallel is False
+
+    ffn_config = afd_vllm_config(
+        role="ffn",
+        enable_expert_parallel=True,
+    )
+    NPUPlatform.check_and_update_config(ffn_config)
+
+    assert observed_ep_values == [True, True, True]
+    assert ffn_config.parallel_config.enable_expert_parallel is True
+
+    sync_attention_config = afd_vllm_config(
+        role="attention",
+        enable_expert_parallel=True,
+        connector="CAMP2pAFDConnector",
+    )
+    NPUPlatform.check_and_update_config(sync_attention_config)
+
+    assert observed_ep_values == [True, True, True, True]
+    assert sync_attention_config.parallel_config.enable_expert_parallel is True

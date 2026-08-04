@@ -122,6 +122,8 @@ def test_runner_builds_npu_async_cam_role_specific_topology():
     assert _arg_value(attention_command, "--tensor-parallel-size") == "2"
     assert _arg_value(ffn_command, "--data-parallel-size") == "2"
     assert _arg_value(ffn_command, "--tensor-parallel-size") == "1"
+    assert "--enable-expert-parallel" not in attention_command
+    assert "--enable-expert-parallel" in ffn_command
     assert "--worker-cls" not in attention_command
     assert "--worker-cls" not in ffn_command
 

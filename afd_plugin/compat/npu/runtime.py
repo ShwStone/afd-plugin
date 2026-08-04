@@ -27,9 +27,11 @@ def apply_afd_ascend_patches_if_needed() -> None:
 
     from afd_plugin.compat.patches.npu.ascend_platform import (
         apply_afd_ascend_dbo_config_patch,
+        apply_afd_ascend_flashcomm1_ep_config_patch,
     )
 
     apply_afd_ascend_dbo_config_patch()
+    apply_afd_ascend_flashcomm1_ep_config_patch()
     _PATCHES_APPLIED = True
 
 

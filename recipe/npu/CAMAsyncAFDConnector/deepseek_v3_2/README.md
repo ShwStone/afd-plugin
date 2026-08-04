@@ -244,6 +244,14 @@ vllm serve /path/to/DeepSeek-V3.2 \
 - Connector: `CAMAsyncAFDConnector`.
 - Current scope: PD-disaggregated prefill stage only.
 
+The Attention commands intentionally omit `--enable-expert-parallel`. AFD's
+Attention role constructs attention, router-gate, and normalization modules but
+does not own routed experts. FlashComm1/SP may still be enabled on this role
+when TP is greater than one; it does not imply EP. The plugin scopes
+vLLM-Ascend's generic MoE validation so that the runtime does not flatten the
+24 Attention ranks into an invalid EP24 expert group. Keep
+`--enable-expert-parallel` on the FFN EP8 command only.
+
 <details>
 <summary>Node0 Attention Deployment Command (DP0-DP1)</summary>
 
@@ -282,7 +290,6 @@ vllm serve /path/to/DeepSeek-V3.2 \
   --data-parallel-rpc-port 29550 \
   --prefill-context-parallel-size 8 \
   --no-enable-chunked-prefill \
-  --enable-expert-parallel \
   --no-enable-prefix-caching \
   --gpu-memory-utilization 0.8 \
   --additional-config '{
@@ -350,7 +357,6 @@ vllm serve /path/to/DeepSeek-V3.2 \
   --headless \
   --prefill-context-parallel-size 8 \
   --no-enable-chunked-prefill \
-  --enable-expert-parallel \
   --additional-config '{
     "afd": {
       "connector": "CAMAsyncAFDConnector",

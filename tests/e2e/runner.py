@@ -357,10 +357,15 @@ def build_vllm_command(
         str(role_dp_size),
         "--tensor-parallel-size",
         str(tp_size),
-        "--enable-expert-parallel",
-        "--additional-config",
-        json.dumps(afd_config, separators=(",", ":")),
     ]
+    if role == "ffn" or connector != ASYNC_AFD_CONNECTOR:
+        cmd.append("--enable-expert-parallel")
+    cmd.extend(
+        [
+            "--additional-config",
+            json.dumps(afd_config, separators=(",", ":")),
+        ],
+    )
     if args.cuda_graph_full_decode_only:
         capture_size = str(args.cudagraph_capture_size)
         cmd.extend(
