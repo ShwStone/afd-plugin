@@ -308,6 +308,12 @@ python -m tools.benchmarks.prefill_report \
 
 ## 6. 敏感性实验
 
+单次全量 cell sweep 完成后的正式重复、固定 workload 消融、prefix cold/steady、
+运行时事件和流水 trace 采集，按
+[`PREFILL_PERFORMANCE_STAGE2_DATA_COLLECTION.zh-CN.md`](PREFILL_PERFORMANCE_STAGE2_DATA_COLLECTION.zh-CN.md)
+执行。该方案将单次 sweep 定义为 exploratory screening，并只对进入正式结论的
+选中 cell 补齐至少 3 次无 profiler 重复。
+
 主矩阵完成后，逐个改变以下因素，禁止同时改变多个因素：
 
 1. prefix cache：off、25%、50%、75%；
