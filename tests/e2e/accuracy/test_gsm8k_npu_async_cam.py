@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from afd_plugin.envs import force_balanced_topk_ids_enabled
 from tests.e2e.conftest import AFDServer, _launch_afd_server
 from tests.e2e.helpers_gsm8k import (
     _extract_gsm8k_accuracy,
@@ -17,6 +18,9 @@ from tests.e2e.helpers_gsm8k import (
 )
 
 ASYNC_MOE_NUM_STAGES = 2
+DEEPSEEK_V3_2_MODEL_TYPE = "deepseek_v32"
+DEEPSEEK_V3_2_ARCHITECTURE = "DeepseekV32ForCausalLM"
+DEEPSEEK_V3_2_NUM_HIDDEN_LAYERS = 61
 
 
 def _default_tasks_dir() -> Path:
@@ -33,6 +37,24 @@ def _npu_list() -> list[str]:
         ).split(",")
         if item.strip()
     ]
+
+
+def _validate_full_deepseek_v3_2_model(model: str) -> None:
+    """Reject reduced or non-V3.2 checkpoints before the expensive evaluation."""
+    config_path = Path(model) / "config.json"
+    assert config_path.is_file(), (
+        f"DeepSeek-V3.2 E2E requires a local checkpoint with config.json; got {model!r}"
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    architectures = config.get("architectures", [])
+    assert (
+        config.get("model_type") == DEEPSEEK_V3_2_MODEL_TYPE
+        or DEEPSEEK_V3_2_ARCHITECTURE in architectures
+    ), f"expected a DeepSeek-V3.2 checkpoint, got config from {config_path}"
+    assert config.get("num_hidden_layers") == DEEPSEEK_V3_2_NUM_HIDDEN_LAYERS, (
+        "DeepSeek-V3.2 E2E must use all 61 layers; "
+        f"got num_hidden_layers={config.get('num_hidden_layers')!r}"
+    )
 
 
 @pytest.mark.npu
@@ -190,3 +212,78 @@ def test_gsm8k_lm_eval_async_cam_dp3tp2_ep2(
     finally:
         if afd_server is not None:
             afd_server.shutdown()
+
+
+@pytest.mark.npu
+@pytest.mark.e2e
+@pytest.mark.eval
+@pytest.mark.slow
+@pytest.mark.skipif(
+    os.environ.get("AFD_NPU_ASYNC_CAM_RUN_V3_2_DP2TP8_EP16") != "1",
+    reason=(
+        "DeepSeek-V3.2 DP2TP8+EP16 GSM8K test is opt-in; set "
+        "AFD_NPU_ASYNC_CAM_RUN_V3_2_DP2TP8_EP16=1 to enable"
+    ),
+)
+def test_gsm8k_lm_eval_async_cam_v3_2_dp2tp8_ep16(
+    npu_available: bool,
+    npu_e2e_model: str,
+    tmp_path: Path,
+) -> None:
+    """Evaluate the externally launched two-node, full-model deployment."""
+    pytest.importorskip("lm_eval", reason="lm-eval not installed")
+    _validate_full_deepseek_v3_2_model(npu_e2e_model)
+    assert not force_balanced_topk_ids_enabled(), (
+        "DeepSeek-V3.2 accuracy must run with AFD_FORCE_BALANCED_TOPK_IDS disabled"
+    )
+
+    tasks_dir = os.environ.get("AFD_NPU_GSM8K_TASK_DIR") or str(
+        _default_tasks_dir(),
+    )
+    if not Path(tasks_dir).is_dir():
+        pytest.skip(
+            f"offline gsm8k task dir not found: {tasks_dir}. "
+            "Stage gsm8k parquet + gsm8k.yaml, or set "
+            "AFD_NPU_GSM8K_TASK_DIR.",
+        )
+
+    base_url = os.environ.get(
+        "AFD_NPU_ASYNC_CAM_V3_2_BASE_URL",
+        "http://127.0.0.1:8000",
+    ).rstrip("/")
+    model_name = os.environ.get(
+        "AFD_NPU_ASYNC_CAM_V3_2_SERVED_MODEL",
+        "deepseek_v3_2",
+    )
+    threshold = float(
+        os.environ.get("AFD_NPU_ASYNC_CAM_V3_2_GSM8K_THRESHOLD", "0.80"),
+    )
+    tolerance = float(
+        os.environ.get("AFD_NPU_ASYNC_CAM_V3_2_GSM8K_TOLERANCE", "0.05"),
+    )
+    configured_limit = os.environ.get("AFD_GSM8K_LIMIT")
+    limit = int(configured_limit) if configured_limit else None
+    batch_size = int(os.environ.get("AFD_GSM8K_BATCH_SIZE", "8"))
+
+    results = _run_lm_eval(
+        base_url=base_url,
+        model_name=model_name,
+        output_path=str(tmp_path / "lm_eval_output_v3_2_dp2tp8_ep16"),
+        tokenizer=npu_e2e_model,
+        tasks_dir=tasks_dir,
+        limit=limit,
+        batch_size=batch_size,
+    )
+    accuracy = _extract_gsm8k_accuracy(results)
+    effective_threshold = threshold - tolerance
+    print(
+        "\n[GSM8K NPU async CAM DeepSeek-V3.2 DP2TP8+EP16] "
+        f"accuracy={accuracy:.4f} threshold={threshold} "
+        f"tolerance={tolerance} effective_min={effective_threshold:.4f} "
+        f"batch_size={batch_size}",
+    )
+    assert accuracy >= effective_threshold, (
+        f"DeepSeek-V3.2 GSM8K accuracy {accuracy:.4f} < effective threshold "
+        f"{effective_threshold:.4f} (threshold={threshold}, "
+        f"tolerance={tolerance})"
+    )
