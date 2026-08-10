@@ -28,12 +28,23 @@ from afd_plugin.model_executor.models import get_afd_metadata_from_forward_conte
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
     AsyncMoeUbatchMetadata,
     CAMDispatchLayout,
+    CAMDispatchPayload,
     build_async_moe_stage_inputs,
     get_async_moe_ubatch_metadata_from_forward_context,
     log_async_moe_stage_attention,
     prepare_cam_dispatch_payload,
     restore_async_moe_stage_outputs,
     restore_cam_dispatch_output,
+)
+from afd_plugin.model_executor.npu.async_cam_tensor_dump import (
+    ASYNC_CAM_TENSOR_DUMP_CONFIG,
+    ATTENTION_DISPATCH_HIDDEN,
+    ATTENTION_FFN_OUTPUT,
+    ATTENTION_ROUTER_LOGITS,
+    ATTENTION_TOPK_IDS,
+    ATTENTION_TOPK_WEIGHTS,
+    AsyncCamTensorDumpConfig,
+    dump_async_cam_tensor,
 )
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
 
@@ -81,6 +92,7 @@ def run_model_forward(
     async_moe_ubatch_metadata = get_async_moe_ubatch_metadata_from_forward_context(
         forward_context
     )
+    tensor_dump_config = ASYNC_CAM_TENSOR_DUMP_CONFIG
     if async_moe_ubatch_metadata is None:
         hidden_states, residual = run_attention_gate_afd_forward(
             model,
@@ -89,6 +101,7 @@ def run_model_forward(
             positions,
             afd_metadata,
             llama_4_scaling,
+            tensor_dump_config,
         )
     else:
         hidden_states, residual = run_async_moe_ubatch_afd_forward(
@@ -99,6 +112,7 @@ def run_model_forward(
             afd_metadata,
             async_moe_ubatch_metadata,
             llama_4_scaling,
+            tensor_dump_config,
         )
 
     if not get_pp_group().is_last_rank:
@@ -116,15 +130,21 @@ def run_attention_gate_afd_forward(
     positions: torch.Tensor,
     afd_metadata: AFDForwardContextMetadata,
     llama_4_scaling: torch.Tensor | None = None,
+    tensor_dump_config: AsyncCamTensorDumpConfig | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the Attention-side gate AFD path used by async CAM."""
 
     afd_connector = afd_metadata.connector
+    if tensor_dump_config is None:
+        tensor_dump_config = ASYNC_CAM_TENSOR_DUMP_CONFIG
     forward_context = get_forward_context()
     stage_idx = int(afd_metadata.stage_idx)
     pending_ffn_recv = False
     pending_dispatch_layout: CAMDispatchLayout | None = None
     pending_dispatch_ref: torch.Tensor | None = None
+    pending_global_token_start = 0
+    pending_valid_rows = 0
+    pending_layer_idx = -1
 
     for layer_offset, layer in enumerate(
         islice(model.layers, model.start_layer, model.end_layer),
@@ -136,6 +156,20 @@ def run_attention_gate_afd_forward(
                 ref_tensor=pending_dispatch_ref,
                 ubatch_idx=stage_idx,
             )
+            if tensor_dump_config.enabled:
+                dump_async_cam_tensor(
+                    local_ffn_output,
+                    tensor_dump_config,
+                    role="attention",
+                    role_rank=afd_connector.role_rank,
+                    layer_idx=pending_layer_idx,
+                    stage_idx=stage_idx,
+                    point=ATTENTION_FFN_OUTPUT,
+                    row_coordinate="global_token",
+                    row_start=pending_global_token_start,
+                    valid_rows=pending_valid_rows,
+                    transaction_id=afd_metadata.transaction_id,
+                )
             hidden_states = restore_cam_dispatch_output(
                 local_ffn_output,
                 pending_dispatch_layout,
@@ -180,6 +214,30 @@ def run_attention_gate_afd_forward(
             router_logits,
             use_sequence_parallel=forward_context.flash_comm_v1_enabled,
         )
+        if tensor_dump_config.enabled:
+            parent_global_token_start = 0
+            real_tokens = sum(afd_metadata.tokens_unpadded_lens)
+            if dispatch_payload.layout.use_sequence_parallel:
+                parent_global_token_start = (
+                    dispatch_payload.layout.tp_rank
+                    * dispatch_payload.layout.parent_tokens
+                )
+            parent_valid_rows = min(
+                dispatch_payload.layout.parent_tokens,
+                max(real_tokens - parent_global_token_start, 0),
+            )
+            pending_global_token_start, pending_valid_rows = (
+                _dump_attention_dispatch_payload(
+                    dispatch_payload,
+                    tensor_dump_config,
+                    role_rank=afd_connector.role_rank,
+                    layer_idx=layer.layer_idx,
+                    stage_idx=stage_idx,
+                    parent_global_token_start=parent_global_token_start,
+                    parent_valid_rows=parent_valid_rows,
+                    transaction_id=afd_metadata.transaction_id,
+                )
+            )
         metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=layer.layer_idx,
             stage_idx=stage_idx,
@@ -196,6 +254,7 @@ def run_attention_gate_afd_forward(
         pending_ffn_recv = True
         pending_dispatch_layout = dispatch_payload.layout
         pending_dispatch_ref = dispatch_payload.hidden_states
+        pending_layer_idx = layer.layer_idx
         hidden_states = maybe_apply_dbo_yield(
             hidden_states,
             role="attention",
@@ -208,6 +267,20 @@ def run_attention_gate_afd_forward(
             ref_tensor=pending_dispatch_ref,
             ubatch_idx=stage_idx,
         )
+        if tensor_dump_config.enabled:
+            dump_async_cam_tensor(
+                local_ffn_output,
+                tensor_dump_config,
+                role="attention",
+                role_rank=afd_connector.role_rank,
+                layer_idx=pending_layer_idx,
+                stage_idx=stage_idx,
+                point=ATTENTION_FFN_OUTPUT,
+                row_coordinate="global_token",
+                row_start=pending_global_token_start,
+                valid_rows=pending_valid_rows,
+                transaction_id=afd_metadata.transaction_id,
+            )
         hidden_states = restore_cam_dispatch_output(
             local_ffn_output,
             pending_dispatch_layout,
@@ -223,10 +296,13 @@ def run_async_moe_ubatch_afd_forward(
     afd_metadata: AFDForwardContextMetadata,
     async_moe_ubatch_metadata: AsyncMoeUbatchMetadata,
     llama_4_scaling: torch.Tensor | None = None,
+    tensor_dump_config: AsyncCamTensorDumpConfig | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the two-stage async MoE ubatch pipeline used by async CAM."""
 
     forward_context = get_forward_context()
+    if tensor_dump_config is None:
+        tensor_dump_config = ASYNC_CAM_TENSOR_DUMP_CONFIG
     runtime_sequence_parallel = bool(forward_context.flash_comm_v1_enabled)
     if runtime_sequence_parallel != async_moe_ubatch_metadata.use_sequence_parallel:
         raise RuntimeError(
@@ -279,6 +355,9 @@ def run_async_moe_ubatch_afd_forward(
         None for _ in stage_hidden_states
     ]
     stage_dispatch_refs: list[torch.Tensor | None] = [None for _ in stage_hidden_states]
+    stage_global_token_starts = [0 for _ in stage_hidden_states]
+    stage_valid_rows = [0 for _ in stage_hidden_states]
+    stage_layer_indices = [-1 for _ in stage_hidden_states]
 
     def compute_stage_attention(
         layer: AFDDeepseekV2DecoderLayer,
@@ -378,6 +457,37 @@ def run_async_moe_ubatch_afd_forward(
             router_logits,
             use_sequence_parallel=async_moe_ubatch_metadata.use_sequence_parallel,
         )
+        if tensor_dump_config.enabled:
+            stage = async_moe_ubatch_metadata.stages[stage_idx]
+            parent_global_token_start = int(stage.token_slice.start)
+            parent_valid_rows = stage.actual_tokens
+            if dispatch_payload.layout.use_sequence_parallel:
+                parent_global_token_start += (
+                    dispatch_payload.layout.tp_rank
+                    * dispatch_payload.layout.parent_tokens
+                )
+                parent_valid_rows = min(
+                    dispatch_payload.layout.parent_tokens,
+                    max(
+                        stage.actual_tokens
+                        - dispatch_payload.layout.tp_rank
+                        * dispatch_payload.layout.parent_tokens,
+                        0,
+                    ),
+                )
+            (
+                stage_global_token_starts[stage_idx],
+                stage_valid_rows[stage_idx],
+            ) = _dump_attention_dispatch_payload(
+                dispatch_payload,
+                tensor_dump_config,
+                role_rank=afd_connector.role_rank,
+                layer_idx=layer.layer_idx,
+                stage_idx=stage_idx,
+                parent_global_token_start=parent_global_token_start,
+                parent_valid_rows=parent_valid_rows,
+                transaction_id=afd_metadata.transaction_id,
+            )
         stage_metadata = AFDTransferMetadata.create_attention_metadata(
             layer_idx=layer.layer_idx,
             stage_idx=stage_idx,
@@ -393,6 +503,7 @@ def run_async_moe_ubatch_afd_forward(
         )
         stage_dispatch_layouts[stage_idx] = dispatch_payload.layout
         stage_dispatch_refs[stage_idx] = dispatch_payload.hidden_states
+        stage_layer_indices[stage_idx] = layer.layer_idx
 
     def recv_stage_ffn(stage_idx: int) -> None:
         dispatch_layout = stage_dispatch_layouts[stage_idx]
@@ -405,6 +516,20 @@ def run_async_moe_ubatch_afd_forward(
             ref_tensor=dispatch_ref,
             ubatch_idx=stage_idx,
         )
+        if tensor_dump_config.enabled:
+            dump_async_cam_tensor(
+                local_ffn_output,
+                tensor_dump_config,
+                role="attention",
+                role_rank=afd_connector.role_rank,
+                layer_idx=stage_layer_indices[stage_idx],
+                stage_idx=stage_idx,
+                point=ATTENTION_FFN_OUTPUT,
+                row_coordinate="global_token",
+                row_start=stage_global_token_starts[stage_idx],
+                valid_rows=stage_valid_rows[stage_idx],
+                transaction_id=afd_metadata.transaction_id,
+            )
         stage_hidden_states[stage_idx] = restore_cam_dispatch_output(
             local_ffn_output,
             dispatch_layout,
@@ -475,6 +600,62 @@ def run_async_moe_ubatch_afd_forward(
         stage_residual,
         async_moe_ubatch_metadata,
     )
+
+
+def _dump_attention_dispatch_payload(
+    dispatch_payload: CAMDispatchPayload,
+    tensor_dump_config: AsyncCamTensorDumpConfig,
+    *,
+    role_rank: int,
+    layer_idx: int,
+    stage_idx: int,
+    parent_global_token_start: int,
+    parent_valid_rows: int,
+    transaction_id: str | None,
+) -> tuple[int, int]:
+    """Dump one CAM payload and return its global real-token extent."""
+
+    layout = dispatch_payload.layout
+    local_start = int(layout.local_token_slice.start)
+    global_token_start = parent_global_token_start + local_start
+    valid_rows = min(
+        layout.local_tokens,
+        max(parent_valid_rows - local_start, 0),
+    )
+    point_tensors = (
+        (ATTENTION_DISPATCH_HIDDEN, dispatch_payload.hidden_states),
+        (ATTENTION_TOPK_WEIGHTS, dispatch_payload.topk_weights),
+        (ATTENTION_TOPK_IDS, dispatch_payload.topk_ids),
+    )
+    for point, tensor in point_tensors:
+        dump_async_cam_tensor(
+            tensor,
+            tensor_dump_config,
+            role="attention",
+            role_rank=role_rank,
+            layer_idx=layer_idx,
+            stage_idx=stage_idx,
+            point=point,
+            row_coordinate="global_token",
+            row_start=global_token_start,
+            valid_rows=valid_rows,
+            transaction_id=transaction_id,
+        )
+    if dispatch_payload.router_logits is not None:
+        dump_async_cam_tensor(
+            dispatch_payload.router_logits,
+            tensor_dump_config,
+            role="attention",
+            role_rank=role_rank,
+            layer_idx=layer_idx,
+            stage_idx=stage_idx,
+            point=ATTENTION_ROUTER_LOGITS,
+            row_coordinate="global_token",
+            row_start=global_token_start,
+            valid_rows=valid_rows,
+            transaction_id=transaction_id,
+        )
+    return global_token_start, valid_rows
 
 
 def _restore_async_moe_stage_state(

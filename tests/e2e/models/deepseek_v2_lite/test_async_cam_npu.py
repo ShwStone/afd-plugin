@@ -139,16 +139,23 @@ def _async_cam_extra_config(model_path: str) -> str:
             ),
         ),
     )
-    return json.dumps(
-        {
-            "dynamicQuant": dynamic_quant,
-            "async_moe_ubatching": False,
-            "async_moe_num_ubatches": 2,
-            "async_moe_split": "request",
-            "attn_ranks_per_dp": 2,
-        },
-        separators=(",", ":"),
-    )
+    async_moe_ubatching = os.environ.get("AFD_NPU_ASYNC_CAM_E2E_UBATCHING", "0") == "1"
+    connector_settings: dict[str, bool | int | str] = {
+        "dynamicQuant": dynamic_quant,
+        "attn_ranks_per_dp": 2,
+    }
+    if async_moe_ubatching:
+        connector_settings.update(
+            {
+                "async_moe_ubatching": True,
+                "async_moe_num_ubatches": 2,
+                "async_moe_split": os.environ.get(
+                    "AFD_NPU_ASYNC_CAM_E2E_SPLIT",
+                    "token",
+                ),
+            }
+        )
+    return json.dumps(connector_settings, separators=(",", ":"))
 
 
 def _async_cam_common_vllm_args() -> list[str]:

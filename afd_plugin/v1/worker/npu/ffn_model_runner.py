@@ -36,6 +36,15 @@ from afd_plugin.connectors.npu.async_cam import (
     AFDAsyncTransferState,
     CAMAsyncAFDConnector,
 )
+from afd_plugin.model_executor.npu.async_cam_tensor_dump import (
+    ASYNC_CAM_TENSOR_DUMP_CONFIG,
+    FFN_GROUP_LIST,
+    FFN_ROUTED_INPUT,
+    FFN_ROUTED_OUTPUT,
+    FFN_SHARED_INPUT,
+    FFN_SHARED_OUTPUT,
+    dump_async_cam_tensor,
+)
 from afd_plugin.v1.worker.attention_model_runner import (
     _resolve_world_ranks,
 )
@@ -283,6 +292,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         stage_idx = 0
         rank_ffn_output = None
         connector = cast(CAMAsyncAFDConnector, self.connector)
+        tensor_dump_config = ASYNC_CAM_TENSOR_DUMP_CONFIG
 
         for _ in _ffn_layer_indices(self):
             work_item = connector.recv_ffn_work_item(
@@ -298,6 +308,41 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 )
             layer_idx = work_item.layer_idx
             num_tokens = work_item.num_tokens
+            if tensor_dump_config.enabled:
+                dump_async_cam_tensor(
+                    hidden_states,
+                    tensor_dump_config,
+                    role="ffn",
+                    role_rank=connector.role_rank,
+                    layer_idx=layer_idx,
+                    stage_idx=stage_idx,
+                    point=FFN_ROUTED_INPUT,
+                    row_coordinate="rank_local",
+                    valid_rows=num_tokens,
+                )
+                if states.group_list is not None:
+                    dump_async_cam_tensor(
+                        states.group_list,
+                        tensor_dump_config,
+                        role="ffn",
+                        role_rank=connector.role_rank,
+                        layer_idx=layer_idx,
+                        stage_idx=stage_idx,
+                        point=FFN_GROUP_LIST,
+                        row_coordinate="rank_local",
+                    )
+                if states.expand_x_shared is not None:
+                    dump_async_cam_tensor(
+                        states.expand_x_shared,
+                        tensor_dump_config,
+                        role="ffn",
+                        role_rank=connector.role_rank,
+                        layer_idx=layer_idx,
+                        stage_idx=stage_idx,
+                        point=FFN_SHARED_INPUT,
+                        row_coordinate="rank_local",
+                        valid_rows=work_item.shared_num_tokens,
+                    )
             afd_metadata = AFDForwardContextMetadata(
                 tokens_start_loc=[0],
                 requests_start_loc=[0],
@@ -326,6 +371,36 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     expand_x_shared=states.expand_x_shared,
                     dynamic_scales_shared=states.dynamic_scales_shared,
                 )
+                if tensor_dump_config.enabled:
+                    if isinstance(rank_ffn_output, AFDF2ATransferPayload):
+                        routed_output = rank_ffn_output.routed_output
+                        shared_output = rank_ffn_output.shared_output
+                    else:
+                        routed_output = rank_ffn_output
+                        shared_output = None
+                    dump_async_cam_tensor(
+                        routed_output,
+                        tensor_dump_config,
+                        role="ffn",
+                        role_rank=connector.role_rank,
+                        layer_idx=layer_idx,
+                        stage_idx=stage_idx,
+                        point=FFN_ROUTED_OUTPUT,
+                        row_coordinate="rank_local",
+                        valid_rows=num_tokens,
+                    )
+                    if shared_output is not None:
+                        dump_async_cam_tensor(
+                            shared_output,
+                            tensor_dump_config,
+                            role="ffn",
+                            role_rank=connector.role_rank,
+                            layer_idx=layer_idx,
+                            stage_idx=stage_idx,
+                            point=FFN_SHARED_OUTPUT,
+                            row_coordinate="rank_local",
+                            valid_rows=work_item.shared_num_tokens,
+                        )
                 rank_ffn_output = connector.send_ffn_work_item_output(
                     work_item,
                     rank_ffn_output,

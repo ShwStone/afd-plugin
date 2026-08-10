@@ -146,6 +146,28 @@ def test_runner_builds_npu_async_cam_role_specific_topology():
     assert afd_config["connector_extra_config"]["async_moe_split"] == "request"
 
 
+@pytest.mark.parametrize(
+    ("ubatching", "expected_split"),
+    (("0", None), ("1", "token")),
+)
+def test_async_cam_smoke_config_can_toggle_token_ubatching(
+    monkeypatch,
+    ubatching,
+    expected_split,
+):
+    monkeypatch.setenv("AFD_NPU_ASYNC_CAM_E2E_DYNAMIC_QUANT", "0")
+    monkeypatch.setenv("AFD_NPU_ASYNC_CAM_E2E_UBATCHING", ubatching)
+    monkeypatch.setenv("AFD_NPU_ASYNC_CAM_E2E_SPLIT", "token")
+
+    connector_config = json.loads(
+        async_cam_e2e._async_cam_extra_config("/models/DeepSeek-V2-Lite")
+    )
+
+    assert connector_config["attn_ranks_per_dp"] == 2
+    assert connector_config.get("async_moe_ubatching", False) == (ubatching == "1")
+    assert connector_config.get("async_moe_split") == expected_split
+
+
 def test_runner_rejects_role_rank_count_not_divisible_by_tp():
     args = _args()
     args.attention_tp_size = 3
