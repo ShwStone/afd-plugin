@@ -18,6 +18,29 @@ rank-local row indices because CAM has already reordered those rows by expert.
 
 ## Run the reduced comparison
 
+The wrapper script runs both cases and the comparison:
+
+```bash
+MODEL_PATH=/path/to/DeepSeek-V2-Lite \
+  tools/run_async_cam_tensor_dump_comparison.sh
+```
+
+The script exports `VLLM_ASCEND_ENABLE_FLASHCOMM1=1` only as input to the E2E
+runner. The runner keeps it for Attention TP2 and removes it from the FFN TP1
+worker environments. The effective topology is therefore Attention
+FlashComm1/SP on and FFN FlashComm1/SP off.
+
+Override the sampled layers or tokens when needed:
+
+```bash
+MODEL_PATH=/path/to/DeepSeek-V2-Lite \
+DUMP_LAYERS=1,2,3,4 \
+DUMP_TOKEN_INDICES=0,1,127,255 \
+  tools/run_async_cam_tensor_dump_comparison.sh
+```
+
+The equivalent manual procedure follows.
+
 Use fresh directories because each process intentionally preserves only the
 first observation of a layer/stage/point:
 
