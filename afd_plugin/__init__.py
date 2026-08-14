@@ -6,10 +6,43 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import os
+import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from afd_plugin.config import AFDConfig, parse_afd_config, parse_optional_afd_config
+
+
+def _configure_afd_plugin_logger() -> None:
+    """Attach a vLLM-style stdout handler to the ``afd_plugin`` logger.
+
+    vLLM's logging setup (``dictConfig``) only configures the ``vllm``
+    namespace. ``afd_plugin`` loggers otherwise inherit the WARNING-level
+    root logger, which silently drops their INFO records in vLLM server
+    logs. Idempotent; honors ``VLLM_LOGGING_LEVEL``.
+    """
+    afd_logger = logging.getLogger(__name__)
+    if any(
+        getattr(handler, "_afd_plugin_handler", False)
+        for handler in afd_logger.handlers
+    ):
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler._afd_plugin_handler = True  # type: ignore[attr-defined]
+    handler.setFormatter(
+        logging.Formatter(
+            "%(levelname)s %(asctime)s [%(filename)s:%(lineno)d] %(message)s",
+            datefmt="%m-%d %H:%M:%S",
+        )
+    )
+    level = os.environ.get("VLLM_LOGGING_LEVEL", "INFO")
+    handler.setLevel(level)
+    afd_logger.addHandler(handler)
+    afd_logger.setLevel(level)
+
+
+_configure_afd_plugin_logger()
 
 
 def __getattr__(name: str):
