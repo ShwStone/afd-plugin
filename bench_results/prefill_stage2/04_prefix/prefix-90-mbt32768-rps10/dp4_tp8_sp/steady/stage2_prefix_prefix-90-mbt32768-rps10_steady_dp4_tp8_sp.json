@@ -1,0 +1,36 @@
+{
+  "batch_tokens": [
+    32768
+  ],
+  "burstiness": 1.0,
+  "datasets": {
+    "0.9": "tools/datasets/cp8sp50k_token_ids_prefix90.jsonl"
+  },
+  "model": "/a3_inference/itask/workdir/tq02357756/shwstone/deepseek-v3.2-reduced",
+  "num_prompts": 875,
+  "num_warmups": 0,
+  "repeats": 3,
+  "request_rates": [
+    10.0
+  ],
+  "result_directory": "bench_results/prefill_stage2/04_prefix/prefix-90-mbt32768-rps10/dp4_tp8_sp/steady",
+  "schema_version": 1,
+  "served_model_name": "deepseek_v3_2",
+  "stage2": {
+    "arrival_schedule": null,
+    "arrival_seed": 20260805,
+    "cache_state": "steady",
+    "case_id": "prefix-90-mbt32768-rps10",
+    "purpose": "prefix",
+    "variant": null,
+    "workload": null
+  },
+  "systems": {
+    "dp4_tp8_sp": {
+      "base_url": "http://127.0.0.1:8000",
+      "endpoint": "/v1/completions",
+      "server_command_template": "MAX_NUM_BATCHED_TOKENS=32768 DP_START_RANK=0 bash tools/benchmarks/prefill_launch_baseline_dp4tp8.sh  # node1: DP_START_RANK=2"
+    }
+  },
+  "ttft_slo_ms": 10000.0
+}

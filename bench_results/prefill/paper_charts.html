@@ -1,0 +1,67 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Prefill Paper Charts</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>body{font-family:sans-serif;margin:20px;background:#fafafa;}
+h1{color:#222;}h3{color:#555;margin:12px 0 4px;}
+.card{background:#fff;border-radius:8px;padding:16px;margin:12px 0;box-shadow:0 1px 3px rgba(0,0,0,.1);}
+</style></head><body>
+<h1>Prefill Performance — prefix cache DISABLED (cold cache)</h1>
+<p>cp8sp50k, 875 requests, 1 output token.</p>
+<h2>Group A: TTFT vs Max Batch Tokens</h2>
+
+<div class="card"><h3>Baseline DP4xTP8 — Mean TTFT vs Max Batch Tokens (prefix=0)</h3>
+<canvas id="ttft_dp4_tp8_sp_mean" height="80"></canvas>
+<script>new Chart(document.getElementById('ttft_dp4_tp8_sp_mean'), {type:'line',
+data:{labels:[8192, 16384, 32768, 49152, 65536],datasets:[{label:'rps=4',data:[655.1, 713.3, 1063.7, 1385.9, 1596.7],borderColor:'#1f77b4',fill:false},{label:'rps=6',data:[809.5, 928.2, 1479.2, 2059.3, 2430.8],borderColor:'#ff7f0e',fill:false},{label:'rps=8',data:[1131.3, 1221.1, 1936.1, 2705.5, 3220.1],borderColor:'#2ca02c',fill:false},{label:'rps=10',data:[3083.0, 1683.7, 2581.3, 3547.8, 4335.2],borderColor:'#d62728',fill:false},{label:'rps=12',data:[9949.6, 6208.9, 7471.6, 8329.8, 10276.6],borderColor:'#9467bd',fill:false}]},
+options:{responsive:true,scales:{x:{title:{display:true,text:'Max Batch Tokens'}},y:{title:{display:true,text:'Mean TTFT (ms)'}}}}});</script></div>
+
+<div class="card"><h3>Baseline DP4xTP8 — P99 TTFT vs Max Batch Tokens (prefix=0)</h3>
+<canvas id="ttft_dp4_tp8_sp_p99" height="80"></canvas>
+<script>new Chart(document.getElementById('ttft_dp4_tp8_sp_p99'), {type:'line',
+data:{labels:[8192, 16384, 32768, 49152, 65536],datasets:[{label:'rps=4',data:[1897.9, 1684.8, 2474.3, 3025.8, 3496.9],borderColor:'#1f77b4',fill:false},{label:'rps=6',data:[2113.1, 2079.7, 2826.9, 3661.9, 4328.4],borderColor:'#ff7f0e',fill:false},{label:'rps=8',data:[2672.8, 2483.5, 3428.3, 4373.3, 4805.4],borderColor:'#2ca02c',fill:false},{label:'rps=10',data:[6133.1, 3546.5, 4638.9, 5993.3, 6985.4],borderColor:'#d62728',fill:false},{label:'rps=12',data:[20587.2, 12251.7, 13923.5, 14967.4, 18900.4],borderColor:'#9467bd',fill:false}]},
+options:{responsive:true,scales:{x:{title:{display:true,text:'Max Batch Tokens'}},y:{title:{display:true,text:'P99 TTFT (ms)'}}}}});</script></div>
+
+<div class="card"><h3>AFD DP3xTP8+EP8 — Mean TTFT vs Max Batch Tokens (prefix=0)</h3>
+<canvas id="ttft_afd_dp3_tp8_ep8_mean" height="80"></canvas>
+<script>new Chart(document.getElementById('ttft_afd_dp3_tp8_ep8_mean'), {type:'line',
+data:{labels:[8192, 16384, 32768, 49152, 65536],datasets:[{label:'rps=4',data:[596.5, 493.1, 459.5, 468.7, 466.0],borderColor:'#1f77b4',fill:false},{label:'rps=6',data:[849.1, 660.0, 549.9, 577.4, 579.7],borderColor:'#ff7f0e',fill:false},{label:'rps=8',data:[2903.0, 1121.8, 1072.9, 1003.1, 975.1],borderColor:'#2ca02c',fill:false},{label:'rps=10',data:[12349.7, 6175.2, 2973.2, 2656.9, 2933.6],borderColor:'#d62728',fill:false},{label:'rps=12',data:[18395.4, 12720.0, 8662.5, 8704.1, 9315.9],borderColor:'#9467bd',fill:false}]},
+options:{responsive:true,scales:{x:{title:{display:true,text:'Max Batch Tokens'}},y:{title:{display:true,text:'Mean TTFT (ms)'}}}}});</script></div>
+
+<div class="card"><h3>AFD DP3xTP8+EP8 — P99 TTFT vs Max Batch Tokens (prefix=0)</h3>
+<canvas id="ttft_afd_dp3_tp8_ep8_p99" height="80"></canvas>
+<script>new Chart(document.getElementById('ttft_afd_dp3_tp8_ep8_p99'), {type:'line',
+data:{labels:[8192, 16384, 32768, 49152, 65536],datasets:[{label:'rps=4',data:[1925.8, 1442.7, 1370.3, 1574.5, 1403.4],borderColor:'#1f77b4',fill:false},{label:'rps=6',data:[2316.8, 1998.8, 1632.4, 1691.8, 1709.7],borderColor:'#ff7f0e',fill:false},{label:'rps=8',data:[7825.4, 3100.2, 4458.8, 3204.7, 2831.2],borderColor:'#2ca02c',fill:false},{label:'rps=10',data:[25635.0, 15148.1, 6196.3, 5347.1, 7131.7],borderColor:'#d62728',fill:false},{label:'rps=12',data:[39124.8, 27275.3, 17705.3, 17845.2, 19148.3],borderColor:'#9467bd',fill:false}]},
+options:{responsive:true,scales:{x:{title:{display:true,text:'Max Batch Tokens'}},y:{title:{display:true,text:'P99 TTFT (ms)'}}}}});</script></div>
+
+<div class="card"><h3>RPS=8, SLO=2s — SLO Attainment vs Max Batch Tokens</h3>
+<canvas id="slo_8_slo2" height="80"></canvas>
+<script>new Chart(document.getElementById('slo_8_slo2'), {type:'line',
+data:{labels:[8192, 16384, 32768, 49152, 65536],datasets:[
+ {label:'Baseline DP4xTP8',data:[89.94, 92.11, 56.69, 11.09, 2.97],borderColor:'#2c7fb8',fill:false},
+ {label:'AFD DP3xTP8+EP8',data:[38.74, 88.69, 88.11, 90.63, 92.34],borderColor:'#d95f0e',fill:false}]},
+options:{responsive:true,scales:{x:{title:{display:true,text:'Max Batch Tokens'}},y:{title:{display:true,text:'SLO attainment (%)'},min:0,max:100}}}});</script></div>
+
+<div class="card"><h3>RPS=10, SLO=5s — SLO Attainment vs Max Batch Tokens</h3>
+<canvas id="slo_10_slo5" height="80"></canvas>
+<script>new Chart(document.getElementById('slo_10_slo5'), {type:'line',
+data:{labels:[8192, 16384, 32768, 49152, 65536],datasets:[
+ {label:'Baseline DP4xTP8',data:[93.49, 100.0, 99.43, 90.86, 73.26],borderColor:'#2c7fb8',fill:false},
+ {label:'AFD DP3xTP8+EP8',data:[12.34, 46.86, 85.14, 97.71, 86.97],borderColor:'#d95f0e',fill:false}]},
+options:{responsive:true,scales:{x:{title:{display:true,text:'Max Batch Tokens'}},y:{title:{display:true,text:'SLO attainment (%)'},min:0,max:100}}}});</script></div>
+
+<div class="card"><h3>RPS=12, SLO=10s — SLO Attainment vs Max Batch Tokens</h3>
+<canvas id="slo_12_slo10" height="80"></canvas>
+<script>new Chart(document.getElementById('slo_12_slo10'), {type:'line',
+data:{labels:[8192, 16384, 32768, 49152, 65536],datasets:[
+ {label:'Baseline DP4xTP8',data:[50.74, 90.06, 72.8, 64.46, 48.23],borderColor:'#2c7fb8',fill:false},
+ {label:'AFD DP3xTP8+EP8',data:[25.26, 38.06, 59.31, 57.83, 53.83],borderColor:'#d95f0e',fill:false}]},
+options:{responsive:true,scales:{x:{title:{display:true,text:'Max Batch Tokens'}},y:{title:{display:true,text:'SLO attainment (%)'},min:0,max:100}}}});</script></div>
+
+<div class="card"><h3>RPS=12, SLO=20s — SLO Attainment vs Max Batch Tokens</h3>
+<canvas id="slo_12_slo20" height="80"></canvas>
+<script>new Chart(document.getElementById('slo_12_slo20'), {type:'line',
+data:{labels:[8192, 16384, 32768, 49152, 65536],datasets:[
+ {label:'Baseline DP4xTP8',data:[97.71, 100.0, 100.0, 100.0, 99.66],borderColor:'#2c7fb8',fill:false},
+ {label:'AFD DP3xTP8+EP8',data:[55.09, 82.06, 100.0, 99.89, 99.77],borderColor:'#d95f0e',fill:false}]},
+options:{responsive:true,scales:{x:{title:{display:true,text:'Max Batch Tokens'}},y:{title:{display:true,text:'SLO attainment (%)'},min:0,max:100}}}});</script></div>
+
+</body></html>

@@ -1,0 +1,177 @@
+{
+  "hbm_gib": 64.0,
+  "kv_bytes_per_token": 11520.0,
+  "kv_gib_per_1m_tokens": 10.728836059570312,
+  "model": {
+    "first_k_dense_replace": 3,
+    "hidden_size": 7168,
+    "intermediate_size": 18432,
+    "kv_lora_rank": 512,
+    "moe_intermediate_size": 2048,
+    "n_routed_experts": 256,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 8,
+    "num_hidden_layers": 10,
+    "qk_rope_head_dim": 64
+  },
+  "recommended_sweep": {
+    "afd": {
+      "max_sustainable_estimate": 262144,
+      "note": "AFD FFN EP8 is compute-bound (soft ceiling); calibration decides the real max. Baseline is activation-memory-bound."
+    },
+    "baseline": {
+      "max_sustainable_estimate": 131072,
+      "note": "Activation-memory-bound above this estimate."
+    }
+  },
+  "systems": {
+    "afd": {
+      "ceiling_activation": 262144,
+      "dp": 3,
+      "ep": 8,
+      "free_activation_gib_per_rank": 11.3,
+      "gpu_util": 0.8,
+      "kv_pool_capacity_tokens_global": 35536629,
+      "ranks": 24,
+      "rows": [
+        {
+          "activation_gib_per_rank_per_step": 0.14,
+          "activation_margin_gib": 11.16,
+          "max_num_batched_tokens": 4096,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 0.28,
+          "activation_margin_gib": 11.02,
+          "max_num_batched_tokens": 8192,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 0.56,
+          "activation_margin_gib": 10.74,
+          "max_num_batched_tokens": 16384,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 1.12,
+          "activation_margin_gib": 10.17,
+          "max_num_batched_tokens": 32768,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 1.69,
+          "activation_margin_gib": 9.61,
+          "max_num_batched_tokens": 49152,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 2.25,
+          "activation_margin_gib": 9.05,
+          "max_num_batched_tokens": 65536,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 3.38,
+          "activation_margin_gib": 7.92,
+          "max_num_batched_tokens": 98304,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 4.5,
+          "activation_margin_gib": 6.8,
+          "max_num_batched_tokens": 131072,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 6.75,
+          "activation_margin_gib": 4.55,
+          "max_num_batched_tokens": 196608,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 9.0,
+          "activation_margin_gib": 2.3,
+          "max_num_batched_tokens": 262144,
+          "oom_risk": false
+        }
+      ],
+      "scheduler_structural_cap_tokens": 2240000,
+      "tp": 8,
+      "weights_gib_per_rank": 3.54
+    },
+    "baseline": {
+      "ceiling_activation": 131072,
+      "dp": 4,
+      "ep": 32,
+      "free_activation_gib_per_rank": 4.9,
+      "gpu_util": 0.9,
+      "kv_pool_capacity_tokens_global": 40969029,
+      "ranks": 32,
+      "rows": [
+        {
+          "activation_gib_per_rank_per_step": 0.11,
+          "activation_margin_gib": 4.79,
+          "max_num_batched_tokens": 4096,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 0.21,
+          "activation_margin_gib": 4.69,
+          "max_num_batched_tokens": 8192,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 0.42,
+          "activation_margin_gib": 4.48,
+          "max_num_batched_tokens": 16384,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 0.84,
+          "activation_margin_gib": 4.06,
+          "max_num_batched_tokens": 32768,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 1.27,
+          "activation_margin_gib": 3.63,
+          "max_num_batched_tokens": 49152,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 1.69,
+          "activation_margin_gib": 3.21,
+          "max_num_batched_tokens": 65536,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 2.53,
+          "activation_margin_gib": 2.37,
+          "max_num_batched_tokens": 98304,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 3.38,
+          "activation_margin_gib": 1.52,
+          "max_num_batched_tokens": 131072,
+          "oom_risk": false
+        },
+        {
+          "activation_gib_per_rank_per_step": 5.06,
+          "activation_margin_gib": -0.16,
+          "max_num_batched_tokens": 196608,
+          "oom_risk": true
+        },
+        {
+          "activation_gib_per_rank_per_step": 6.75,
+          "activation_margin_gib": -1.85,
+          "max_num_batched_tokens": 262144,
+          "oom_risk": true
+        }
+      ],
+      "scheduler_structural_cap_tokens": 560000,
+      "tp": 8,
+      "weights_gib_per_rank": 2.66
+    }
+  }
+}
