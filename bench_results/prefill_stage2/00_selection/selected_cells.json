@@ -1,0 +1,86 @@
+{
+  "cells": [
+    {
+      "batch_tokens": 65536,
+      "case_id": "real-low-p0-mbt65536-rps4",
+      "dataset_sha256": "1d14e1e8e62f0af31f9deace43e1a13204fc5a932fc5a0107cc60f8166cefc71",
+      "prefix_ratio": "0",
+      "purpose": "low",
+      "request_ids_sha256": "172ecd44b1071910e1d03b2866fa8278bc67e7f00a8cb41e7a64b7d708cc1fd7",
+      "rps": 4.0,
+      "selection_reason": "Sweep: both 875/0 no failure, no queuing, SLO 100/100%. AFD 466ms vs baseline 1597ms (71% faster), AFD headline sweet spot (bt>=16384). Regression guard covers bt<16384."
+    },
+    {
+      "batch_tokens": 32768,
+      "case_id": "real-knee-p0-mbt32768-rps10",
+      "dataset_sha256": "1d14e1e8e62f0af31f9deace43e1a13204fc5a932fc5a0107cc60f8166cefc71",
+      "prefix_ratio": "0",
+      "purpose": "knee",
+      "request_ids_sha256": "172ecd44b1071910e1d03b2866fa8278bc67e7f00a8cb41e7a64b7d708cc1fd7",
+      "rps": 10.0,
+      "selection_reason": "Sweep: last healthy point before baseline SLO drops. baseline 2581ms/SLO100%, AFD 2973ms/SLO100%. bt=32768 covers batch coverage; doubles as prefix anchor."
+    },
+    {
+      "batch_tokens": 65536,
+      "case_id": "real-high-p0-mbt65536-rps10",
+      "dataset_sha256": "1d14e1e8e62f0af31f9deace43e1a13204fc5a932fc5a0107cc60f8166cefc71",
+      "prefix_ratio": "0",
+      "purpose": "high",
+      "request_ids_sha256": "172ecd44b1071910e1d03b2866fa8278bc67e7f00a8cb41e7a64b7d708cc1fd7",
+      "rps": 10.0,
+      "selection_reason": "Sweep: high pressure after knee; AFD 2934ms vs baseline 4335ms (32% faster), SLO 100%/100%. Covers long-request (>48K) bucket at max batch."
+    },
+    {
+      "batch_tokens": 8192,
+      "case_id": "real-regress-p0-mbt8192-rps10",
+      "dataset_sha256": "1d14e1e8e62f0af31f9deace43e1a13204fc5a932fc5a0107cc60f8166cefc71",
+      "prefix_ratio": "0",
+      "purpose": "regression-guard",
+      "request_ids_sha256": "172ecd44b1071910e1d03b2866fa8278bc67e7f00a8cb41e7a64b7d708cc1fd7",
+      "rps": 10.0,
+      "selection_reason": "Sweep: largest reproducible AFD regression, both completed. AFD 12350ms vs baseline 3083ms (4.0x slower), SLO 43% vs 100%."
+    },
+    {
+      "batch_tokens": 8192,
+      "case_id": "real-regress-healthy-p0-mbt8192-rps8",
+      "dataset_sha256": "1d14e1e8e62f0af31f9deace43e1a13204fc5a932fc5a0107cc60f8166cefc71",
+      "prefix_ratio": "0",
+      "purpose": "regression-healthy",
+      "request_ids_sha256": "172ecd44b1071910e1d03b2866fa8278bc67e7f00a8cb41e7a64b7d708cc1fd7",
+      "rps": 8.0,
+      "selection_reason": "Sweep: regression mechanism isolated, both SLO 100%. AFD 2903ms vs baseline 1131ms (2.6x slower)."
+    },
+    {
+      "batch_tokens": 32768,
+      "case_id": "prefix-50-mbt32768-rps10",
+      "dataset_sha256": "a79162d32c6749286673c02c3531984dc2c202a3bcf30c0b8b513efedd7fc9f6",
+      "prefix_ratio": "0.50",
+      "purpose": "prefix",
+      "request_ids_sha256": "172ecd44b1071910e1d03b2866fa8278bc67e7f00a8cb41e7a64b7d708cc1fd7",
+      "rps": 10.0,
+      "selection_reason": "Prefix sensitivity at anchor (knee cell). baseline 1256ms/SLO100%, AFD 685ms/SLO100%. cold/steady both required."
+    },
+    {
+      "batch_tokens": 32768,
+      "case_id": "prefix-90-mbt32768-rps10",
+      "dataset_sha256": "e5aa37435d18bc63cae99eacc7e8ec5efcb0a45e581849021f930ce1c82bfc12",
+      "prefix_ratio": "0.90",
+      "purpose": "prefix",
+      "request_ids_sha256": "172ecd44b1071910e1d03b2866fa8278bc67e7f00a8cb41e7a64b7d708cc1fd7",
+      "rps": 10.0,
+      "selection_reason": "Prefix sensitivity at anchor (knee cell). baseline 239ms/SLO100%, AFD 398ms/SLO100%. cold/steady both required."
+    },
+    {
+      "batch_tokens": 32768,
+      "case_id": "prefix-99-mbt32768-rps10",
+      "dataset_sha256": "840af03f460f8f3f153ed2900d867a2b11744d028b229979971113f97bd6efe7",
+      "prefix_ratio": "0.99",
+      "purpose": "prefix",
+      "request_ids_sha256": "172ecd44b1071910e1d03b2866fa8278bc67e7f00a8cb41e7a64b7d708cc1fd7",
+      "rps": 10.0,
+      "selection_reason": "Prefix sensitivity at anchor (knee cell). baseline 152ms/SLO100%, AFD 213ms/SLO100%. cold/steady both required."
+    }
+  ],
+  "selection_version": 1,
+  "source_sweep_report_sha256": "097223e7a4d206affcfdf5182941d35267ef7340b8c7dfd295fc0865d04430d7"
+}

@@ -1,0 +1,49 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Stage-1 深挖 — 多视角分析</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>body{font-family:sans-serif;margin:20px;background:#fafafa;}
+.card{background:#fff;border:1px solid #ddd;border-radius:6px;padding:14px;margin:14px 0;}
+h3{margin:0 0 10px;font-size:15px;}</style></head><body>
+<h2>Stage-1 350-cell 深挖 — 多视角分析</h2>
+<div class="card"><h3>1. 弹性系数（ln TTFT ~ ln bt + rps + prefix）</h3>
+<canvas id="ela" height="60"></canvas>
+<script>new Chart(document.getElementById('ela'),{type:'bar',data:{labels:['b_bt (bt 弹性)','b_rps (每 rps)','b_pre (每 prefix)'],
+datasets:[{label:'Baseline',data:[0.312, 0.027, -2.535],backgroundColor:'#2c7fb8'},{label:'AFD',data:[-0.127, 0.162, -1.999],backgroundColor:'#d95f0e'}]},
+options:{responsive:true,scales:{y:{title:{display:true,text:'回归系数'}}}}});</script></div><div class="card"><h3>2. TTFT vs max batch（prefix=0, rps=4）— 交叉点可见</h3>
+<canvas id="ttft4.0" height="60"></canvas>
+<script>new Chart(document.getElementById('ttft4.0'),{type:'line',
+data:{labels:[8192, 16384, 32768, 49152, 65536],datasets:[{label:'Baseline',data:[655.0, 713.0, 1064.0, 1386.0, 1597.0],borderColor:'#2c7fb8',backgroundColor:'#2c7fb8',fill:false},{label:'AFD',data:[597.0, 493.0, 459.0, 469.0, 466.0],borderColor:'#d95f0e',backgroundColor:'#d95f0e',fill:false}]},
+options:{responsive:true,scales:{x:{type:'logarithmic',title:{display:true,text:'Max Batch Tokens'}},
+y:{title:{display:true,text:'Mean TTFT (ms)'}}}}});</script></div><div class="card"><h3>2. TTFT vs max batch（prefix=0, rps=10）— 交叉点可见</h3>
+<canvas id="ttft10.0" height="60"></canvas>
+<script>new Chart(document.getElementById('ttft10.0'),{type:'line',
+data:{labels:[8192, 16384, 32768, 49152, 65536],datasets:[{label:'Baseline',data:[3083.0, 1684.0, 2581.0, 3548.0, 4335.0],borderColor:'#2c7fb8',backgroundColor:'#2c7fb8',fill:false},{label:'AFD',data:[12350.0, 6175.0, 2973.0, 2657.0, 2934.0],borderColor:'#d95f0e',backgroundColor:'#d95f0e',fill:false}]},
+options:{responsive:true,scales:{x:{type:'logarithmic',title:{display:true,text:'Max Batch Tokens'}},
+y:{title:{display:true,text:'Mean TTFT (ms)'}}}}});</script></div><div class="card"><h3>3. 每步有效时间 vs bt（中位 16936-token 请求, prefix=0 rps4）</h3>
+<canvas id="step" height="60"></canvas>
+<script>new Chart(document.getElementById('step'),{type:'line',
+data:{labels:["8192", "16384", "32768", "49152", "65536"],datasets:[{label:'Baseline 每步 ms',data:[218.4, 356.7, 1063.7, 1385.9, 1596.7],borderColor:'#2c7fb8',backgroundColor:'#2c7fb8',fill:false},{label:'AFD 每步 ms',data:[198.8, 246.6, 459.5, 468.7, 466.0],borderColor:'#d95f0e',backgroundColor:'#d95f0e',fill:false}]},
+options:{responsive:true,scales:{y:{title:{display:true,text:'ms / step'}}}}});</script></div><div class="card"><h3>4. 单请求端到端吞吐 vs bt（16936 tokens / TTFT）</h3>
+<canvas id="thr" height="60"></canvas>
+<script>new Chart(document.getElementById('thr'),{type:'line',
+data:{labels:["8192", "16384", "32768", "49152", "65536"],datasets:[{label:'Baseline tok/ms',data:[25.85, 23.74, 15.92, 12.22, 10.61],borderColor:'#2c7fb8',backgroundColor:'#2c7fb8',fill:false},{label:'AFD tok/ms',data:[28.39, 34.35, 36.86, 36.14, 36.34],borderColor:'#d95f0e',backgroundColor:'#d95f0e',fill:false}]},
+options:{responsive:true,scales:{y:{title:{display:true,text:'tokens / ms'}}}}});</script></div><div class="card"><h3>5. Prefix 边际降幅 %（rps8, bt32768）— 两系统敏感谱相反</h3>
+<canvas id="pm" height="60"></canvas>
+<script>new Chart(document.getElementById('pm'),{type:'bar',
+data:{labels:["0->0.25", "0.25->0.5", "0.5->0.75", "0.75->0.9", "0.9->0.95", "0.95->0.99"],datasets:[{label:'Baseline',data:[11.6, 30.3, 62.2, 43.6, 26.4, 12.6],backgroundColor:'#2c7fb8'},
+{label:'AFD',data:[38.7, 23.3, 24.7, 11.0, 6.3, 47.8],backgroundColor:'#d95f0e'}]},
+options:{responsive:true,scales:{y:{title:{display:true,text:'TTFT 降幅 %'}}}}});</script></div><div class="card"><h3>6. P99/Mean 尾比 by rps</h3>
+<canvas id="tail" height="60"></canvas>
+<script>new Chart(document.getElementById('tail'),{type:'line',
+data:{labels:["4.0", "6.0", "8.0", "10.0", "12.0"],datasets:[{label:'Baseline',data:[2.63, 3.12, 3.18, 3.06, 2.77],borderColor:'#2c7fb8',backgroundColor:'#2c7fb8',fill:false},{label:'AFD',data:[3.19, 3.23, 3.22, 2.94, 2.8],borderColor:'#d95f0e',backgroundColor:'#d95f0e',fill:false}]},
+options:{responsive:true,scales:{y:{title:{display:true,text:'p99/mean'}}}}});</script></div><div class="card"><h3>7. 负载退化因子（rps12/rps4 @prefix=0）</h3>
+<canvas id="deg" height="60"></canvas>
+<script>new Chart(document.getElementById('deg'),{type:'bar',
+data:{labels:["8192", "16384", "32768", "49152", "65536"],datasets:[{label:'Baseline',data:[15.19, 8.7, 7.02, 6.01, 6.44],backgroundColor:'#2c7fb8'},
+{label:'AFD',data:[30.84, 25.8, 18.85, 18.57, 19.99],backgroundColor:'#d95f0e'}]},
+options:{responsive:true,scales:{y:{title:{display:true,text:'TTFT ×'}}}}});</script></div><div class="card"><h3>8. 交叉边界：prefix=0 下 AFD 最小反超 bt vs rps</h3>
+<canvas id="cr" height="60"></canvas>
+<script>new Chart(document.getElementById('cr'),{type:'line',
+data:{labels:[4.0, 6.0, 8.0, 10.0, 12.0],datasets:[{label:'最小反超 bt',data:[8192, 16384, 16384, 49152, 65536],borderColor:'#111111',backgroundColor:'#111111',fill:false}]},
+options:{responsive:true,scales:{y:{type:'logarithmic',title:{display:true,text:'bt'}}}}});</script></div>
+</body></html>

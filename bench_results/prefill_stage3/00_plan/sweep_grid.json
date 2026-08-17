@@ -1,0 +1,56 @@
+{
+  "cells": [
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt4096/dp4_tp8_sp/stage3_btsweep_rps6_mbt4096_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt8192/dp4_tp8_sp/stage3_btsweep_rps6_mbt8192_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps8/mbt8192/dp4_tp8_sp/stage3_btsweep_rps8_mbt8192_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt16384/dp4_tp8_sp/stage3_btsweep_rps6_mbt16384_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt32768/dp4_tp8_sp/stage3_btsweep_rps6_mbt32768_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps8/mbt32768/dp4_tp8_sp/stage3_btsweep_rps8_mbt32768_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt49152/dp4_tp8_sp/stage3_btsweep_rps6_mbt49152_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt65536/dp4_tp8_sp/stage3_btsweep_rps6_mbt65536_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps8/mbt65536/dp4_tp8_sp/stage3_btsweep_rps8_mbt65536_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt98304/dp4_tp8_sp/stage3_btsweep_rps6_mbt98304_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt131072/dp4_tp8_sp/stage3_btsweep_rps6_mbt131072_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps8/mbt131072/dp4_tp8_sp/stage3_btsweep_rps8_mbt131072_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt4096/afd_dp3_tp8_ep8/stage3_btsweep_rps6_mbt4096_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt8192/afd_dp3_tp8_ep8/stage3_btsweep_rps6_mbt8192_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps8/mbt8192/afd_dp3_tp8_ep8/stage3_btsweep_rps8_mbt8192_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt16384/afd_dp3_tp8_ep8/stage3_btsweep_rps6_mbt16384_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt32768/afd_dp3_tp8_ep8/stage3_btsweep_rps6_mbt32768_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps8/mbt32768/afd_dp3_tp8_ep8/stage3_btsweep_rps8_mbt32768_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt49152/afd_dp3_tp8_ep8/stage3_btsweep_rps6_mbt49152_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt65536/afd_dp3_tp8_ep8/stage3_btsweep_rps6_mbt65536_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps8/mbt65536/afd_dp3_tp8_ep8/stage3_btsweep_rps8_mbt65536_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt98304/afd_dp3_tp8_ep8/stage3_btsweep_rps6_mbt98304_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps6/mbt131072/afd_dp3_tp8_ep8/stage3_btsweep_rps6_mbt131072_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/01_sweep/rps8/mbt131072/afd_dp3_tp8_ep8/stage3_btsweep_rps8_mbt131072_afd_dp3_tp8_ep8.json"
+  ],
+  "mbs": [
+    4096,
+    8192,
+    16384,
+    32768,
+    49152,
+    65536,
+    98304,
+    131072
+  ],
+  "note": "cells are in server-reuse order (system, mbt, rps).",
+  "profile_cells": [
+    "bench_results/prefill_stage3/02_profile/rps6/mbt8192/dp4_tp8_sp/stage3_profile_rps6_mbt8192_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/02_profile/rps6/mbt8192/afd_dp3_tp8_ep8/stage3_profile_rps6_mbt8192_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/02_profile/rps6/mbt32768/dp4_tp8_sp/stage3_profile_rps6_mbt32768_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/02_profile/rps6/mbt32768/afd_dp3_tp8_ep8/stage3_profile_rps6_mbt32768_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/02_profile/rps6/mbt131072/dp4_tp8_sp/stage3_profile_rps6_mbt131072_dp4_tp8_sp.json",
+    "bench_results/prefill_stage3/02_profile/rps6/mbt131072/afd_dp3_tp8_ep8/stage3_profile_rps6_mbt131072_afd_dp3_tp8_ep8.json",
+    "bench_results/prefill_stage3/02_profile/rps8/mbt32768/afd_dp3_tp8_ep8/stage3_profile_rps8_mbt32768_afd_dp3_tp8_ep8.json"
+  ],
+  "rps_main": 6.0,
+  "rps_sub": 8.0,
+  "sub_mbs": [
+    8192,
+    32768,
+    65536,
+    131072
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "model": "/a3_inference/itask/workdir/tq02357756/shwstone/deepseek-v3.2-reduced",
+  "served_model_name": "deepseek_v3_2",
+  "result_directory": "bench_results/prefill",
+  "datasets": {
+    "0": "tools/datasets/cp8sp50k_token_ids.jsonl",
+    "0.25": "tools/datasets/cp8sp50k_token_ids_prefix25.jsonl",
+    "0.5": "tools/datasets/cp8sp50k_token_ids_prefix50.jsonl",
+    "0.75": "tools/datasets/cp8sp50k_token_ids_prefix75.jsonl",
+    "0.9": "tools/datasets/cp8sp50k_token_ids_prefix90.jsonl",
+    "0.95": "tools/datasets/cp8sp50k_token_ids_prefix95.jsonl",
+    "0.99": "tools/datasets/cp8sp50k_token_ids_prefix99.jsonl"
+  },
+  "systems": {
+    "dp4_tp8_sp": {
+      "base_url": "http://127.0.0.1:8000",
+      "endpoint": "/v1/completions",
+      "server_command_template": "MAX_NUM_BATCHED_TOKENS={max_num_batched_tokens} DP_START_RANK=0 bash tools/benchmarks/prefill_launch_baseline_dp4tp8.sh  # node1: DP_START_RANK=2"
+    },
+    "afd_dp3_tp8_ep8": {
+      "base_url": "http://127.0.0.1:8000",
+      "endpoint": "/v1/completions",
+      "server_command_template": "MAX_NUM_BATCHED_TOKENS={max_num_batched_tokens} DP_START_RANK=0 bash tools/benchmarks/prefill_launch_afd_attention.sh  # node1: DP_START_RANK=2 ATTN_DEVICES=0-7 attention + FFN EP8 devices 8-15"
+    }
+  },
+  "batch_tokens": [
+    8192,
+    16384,
+    32768,
+    49152,
+    65536
+  ],
+  "request_rates": [
+    4,
+    6,
+    8,
+    10,
+    12
+  ],
+  "repeats": 1,
+  "num_prompts": 875,
+  "num_warmups": 32,
+  "ttft_slo_ms": 10000,
+  "burstiness": 1.0
+}
