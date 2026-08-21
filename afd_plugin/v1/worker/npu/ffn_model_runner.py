@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from afd_plugin.connectors import AFDConnectorBase
 
 logger = init_logger(__name__)
+FFN_COMPUTE_TRACE_EVENT = "afd.ffn.compute"
 
 
 class AFDNPUFFNModelRunner(NPUModelRunner):
@@ -86,6 +87,7 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
             current_platform.get_global_graph_pool() if self.use_aclgraph else None
         )
         self.prof = create_afd_npu_profiler("ffn")
+        self._afd_connector_work_item_counter = 0
         self._is_shutdown = False
 
     @staticmethod
@@ -136,8 +138,23 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 "execute_connector_driven_step requires a connector-driven "
                 "AFD connector",
             )
-        step_afd_npu_profiler(self.prof)
-        self._ffn_forward_connector_driven()
+        connector = cast(CAMAsyncAFDConnector, self.connector)
+        layer_indices = list(_ffn_layer_indices(self))
+        num_stages = (
+            connector.extra_info.async_moe_num_ubatches
+            if connector.extra_info.async_moe_ubatching
+            else 1
+        )
+        if not layer_indices:
+            step_afd_npu_profiler(self.prof)
+            return None
+        work_items_per_transaction = len(layer_indices) * num_stages
+        if self._afd_connector_work_item_counter % work_items_per_transaction == 0:
+            step_afd_npu_profiler(self.prof)
+        self._ffn_forward_connector_driven(
+            layer_indices=layer_indices,
+            num_stages=num_stages,
+        )
         return None
 
     def execute_model(
@@ -279,15 +296,25 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
 
     def _ffn_forward_connector_driven(
         self,
+        *,
+        layer_indices: list[int],
+        num_stages: int,
     ) -> torch.Tensor | AFDF2ATransferPayload | None:
-        stage_idx = 0
         rank_ffn_output = None
         connector = cast(CAMAsyncAFDConnector, self.connector)
 
-        for _ in _ffn_layer_indices(self):
+        for _ in layer_indices:
+            transaction_id, expected_layer_idx, stage_idx = (
+                self._next_afd_trace_transfer_identity(
+                    layer_indices,
+                    num_stages=num_stages,
+                )
+            )
             work_item = connector.recv_ffn_work_item(
                 stage_idx=stage_idx,
                 max_num_tokens=self.max_num_tokens,
+                transaction_id=transaction_id,
+                layer_idx=expected_layer_idx,
             )
             hidden_states = work_item.hidden_states
             metadata = work_item.context.metadata
@@ -318,19 +345,51 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                 forward_context.additional_kwargs["afd_metadata"] = metadata
                 _set_moe_layer_index(forward_context, layer_idx)
 
-                rank_ffn_output = self.model.compute_ffn_output(
-                    hidden_states=hidden_states,
+                flow_id = self.connector.trace_recorder.make_flow_id(
+                    metadata.transaction_id,
                     layer_idx=layer_idx,
-                    group_list=states.group_list,
-                    dynamic_scales=states.dynamic_scales,
-                    expand_x_shared=states.expand_x_shared,
-                    dynamic_scales_shared=states.dynamic_scales_shared,
+                    stage_idx=stage_idx,
                 )
+                with self.connector.trace_recorder.record_range(
+                    FFN_COMPUTE_TRACE_EVENT,
+                    flow_id=flow_id,
+                    transaction_id=metadata.transaction_id,
+                    layer_idx=layer_idx,
+                    stage_idx=stage_idx,
+                    num_tokens=num_tokens,
+                ):
+                    rank_ffn_output = self.model.compute_ffn_output(
+                        hidden_states=hidden_states,
+                        layer_idx=layer_idx,
+                        group_list=states.group_list,
+                        dynamic_scales=states.dynamic_scales,
+                        expand_x_shared=states.expand_x_shared,
+                        dynamic_scales_shared=states.dynamic_scales_shared,
+                    )
                 rank_ffn_output = connector.send_ffn_work_item_output(
                     work_item,
                     rank_ffn_output,
                 )
         return rank_ffn_output
+
+    def _next_afd_trace_transfer_identity(
+        self,
+        layer_indices: list[int],
+        *,
+        num_stages: int,
+    ) -> tuple[str, int, int]:
+        work_items_per_transaction = len(layer_indices) * num_stages
+        transaction_ordinal, position = divmod(
+            self._afd_connector_work_item_counter,
+            work_items_per_transaction,
+        )
+        layer_offset, stage_idx = divmod(position, num_stages)
+        self._afd_connector_work_item_counter += 1
+        return (
+            f"afd-npu-{transaction_ordinal}",
+            layer_indices[layer_offset],
+            stage_idx,
+        )
 
     def capture_model(
         self,
