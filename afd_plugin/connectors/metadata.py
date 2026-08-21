@@ -183,11 +183,14 @@ class AFDTransferMetadata:
             the expected leading dimension for tensors validated against this
             metadata. For one-to-one transfers this is usually a single-item
             list; for fan-in/fan-out paths it can describe split sizes.
+        transaction_id: Optional execution-step identifier used only to
+            correlate diagnostic events across Attention and FFN processes.
     """
 
     layer_idx: int
     stage_idx: int
     seq_lens: list[int]
+    transaction_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.seq_lens:
@@ -206,11 +209,13 @@ class AFDTransferMetadata:
         layer_idx: int,
         stage_idx: int,
         seq_len: int,
+        transaction_id: str | None = None,
     ) -> AFDTransferMetadata:
         return cls(
             layer_idx=layer_idx,
             stage_idx=stage_idx,
             seq_lens=[seq_len],
+            transaction_id=transaction_id,
         )
 
     @classmethod
@@ -220,11 +225,13 @@ class AFDTransferMetadata:
         layer_idx: int,
         stage_idx: int,
         seq_lens: list[int],
+        transaction_id: str | None = None,
     ) -> AFDTransferMetadata:
         return cls(
             layer_idx=layer_idx,
             stage_idx=stage_idx,
             seq_lens=list(seq_lens),
+            transaction_id=transaction_id,
         )
 
     def validate_tensor_shape(self, tensor_shape: tuple[int, ...]) -> bool:

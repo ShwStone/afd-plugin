@@ -306,3 +306,5 @@ available: `async_dispatch_send`, `async_dispatch_recv`,
 
 For startup, HCCL, CAM operator, and shutdown failures, see the
 [NPU troubleshooting guide](TROUBLESHOOTING.md).
+For cross-process profiler diagnosis, see
+[Correlating Attention and FFN profiler timelines](AFD_CORRELATION_TRACING.md).

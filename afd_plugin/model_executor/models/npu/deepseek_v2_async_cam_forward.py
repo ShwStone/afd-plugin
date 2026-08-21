@@ -179,6 +179,7 @@ def run_attention_gate_afd_forward(
             layer_idx=layer.layer_idx,
             stage_idx=stage_idx,
             seq_len=int(dispatch_payload.hidden_states.shape[0]),
+            transaction_id=afd_metadata.transaction_id,
         )
         context = AFDTransferContext(metadata=metadata)
         afd_connector.send_attn_output(
@@ -377,6 +378,7 @@ def run_async_moe_ubatch_afd_forward(
             layer_idx=layer.layer_idx,
             stage_idx=stage_idx,
             seq_len=int(dispatch_payload.hidden_states.shape[0]),
+            transaction_id=afd_metadata.transaction_id,
         )
         stage_context = AFDTransferContext(metadata=stage_metadata)
         afd_connector.send_attn_output(

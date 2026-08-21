@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -134,6 +135,19 @@ class _FakeTorch:
 
     def zeros(self, shape, *, dtype, device):
         return _FakeTensor(shape, dtype=dtype, device=device)
+
+
+class _RecordingTraceRecorder:
+    def __init__(self):
+        self.ranges = []
+
+    def make_flow_id(self, transaction_id, *, layer_idx, stage_idx):
+        return f"{transaction_id}:{layer_idx}:{stage_idx}"
+
+    @contextmanager
+    def record_range(self, event, **kwargs):
+        self.ranges.append((event, kwargs))
+        yield
 
 
 def _vllm_config(*, tp_size: int = 1, pcp_size: int = 1, extra_config=None):
@@ -437,6 +451,7 @@ def test_async_connector_calls_cam_shaped_ops(monkeypatch):
         0,
     )
     connector._initialized = True
+    connector.trace_recorder = _RecordingTraceRecorder()
     connector.comm_args = _FakeTensor((1,), dtype="fp16")
     connector._placeholder = _FakeTensor((8, 16))
     hidden_states = _FakeTensor((3, 16))
@@ -444,6 +459,7 @@ def test_async_connector_calls_cam_shaped_ops(monkeypatch):
         layer_idx=2,
         stage_idx=0,
         seq_len=3,
+        transaction_id="afd-npu-2",
     )
     context = AFDTransferContext(metadata=metadata)
 
@@ -468,6 +484,28 @@ def test_async_connector_calls_cam_shaped_ops(monkeypatch):
     assert fake_torch.ops.umdk_cam_op_lib.calls[0][1][14] == 4
     assert isinstance(context.states, AFDAsyncTransferState)
     assert isinstance(context.states, AFDTransferState)
+    assert connector.trace_recorder.ranges == [
+        (
+            "afd.cam.dispatch_send",
+            {
+                "flow_id": "afd-npu-2:2:0",
+                "transaction_id": "afd-npu-2",
+                "layer_idx": 2,
+                "stage_idx": 0,
+                "num_tokens": 3,
+            },
+        ),
+        (
+            "afd.cam.combine_recv",
+            {
+                "flow_id": "afd-npu-2:2:0",
+                "transaction_id": "afd-npu-2",
+                "layer_idx": 2,
+                "stage_idx": 0,
+                "num_tokens": 3,
+            },
+        ),
+    ]
 
 
 def test_async_ffn_side_dispatch_recv_and_combine_send(monkeypatch):
@@ -484,10 +522,15 @@ def test_async_ffn_side_dispatch_recv_and_combine_send(monkeypatch):
         0,
     )
     connector._initialized = True
+    connector.trace_recorder = _RecordingTraceRecorder()
     connector.comm_args = _FakeTensor((1,), dtype="fp16")
     connector._placeholder = _FakeTensor((8, 16))
 
-    recv_output = connector.recv_attn_output(batch_size=4, layer_idx=1)
+    recv_output = connector.recv_attn_output(
+        batch_size=4,
+        layer_idx=1,
+        transaction_id="afd-npu-3",
+    )
     connector.send_ffn_output(recv_output.hidden_states, recv_output.context)
 
     states = recv_output.context.states
@@ -505,6 +548,28 @@ def test_async_ffn_side_dispatch_recv_and_combine_send(monkeypatch):
         fake_torch.ops.umdk_cam_op_lib.calls[1][1][3]
         is states.token_nums_rankid_layeridx
     )
+    assert connector.trace_recorder.ranges == [
+        (
+            "afd.cam.dispatch_recv",
+            {
+                "flow_id": "afd-npu-3:1:0",
+                "transaction_id": "afd-npu-3",
+                "layer_idx": 1,
+                "stage_idx": 0,
+                "num_tokens": 4,
+            },
+        ),
+        (
+            "afd.cam.combine_send",
+            {
+                "flow_id": "afd-npu-3:1:0",
+                "transaction_id": "afd-npu-3",
+                "layer_idx": 1,
+                "stage_idx": 0,
+                "num_tokens": 4,
+            },
+        ),
+    ]
 
 
 def test_async_combine_send_requires_dispatch_recv_token_metadata(monkeypatch):
@@ -547,12 +612,21 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
     )
     connector.ffn_size = 2
 
-    def fake_recv_attn_output(*, stage_idx, layer_idx, batch_size, ubatch_idx):
+    def fake_recv_attn_output(
+        *,
+        stage_idx,
+        layer_idx,
+        batch_size,
+        ubatch_idx,
+        transaction_id,
+    ):
         assert ubatch_idx == 0
+        assert transaction_id == "afd-npu-4"
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=stage_idx,
             seq_lens=[max(1, batch_size)],
+            transaction_id=transaction_id,
         )
         states = AFDAsyncTransferState(
             batch_size=max(1, batch_size),
@@ -580,6 +654,8 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
     work_item = connector.recv_ffn_work_item(
         stage_idx=0,
         max_num_tokens=16,
+        transaction_id="afd-npu-4",
+        layer_idx=11,
     )
 
     states = work_item.context.states
@@ -591,6 +667,7 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
     assert work_item.hidden_states == "hidden[:5]"
     assert work_item.context.metadata.layer_idx == 11
     assert work_item.context.metadata.seq_lens == [5]
+    assert work_item.context.metadata.transaction_id == "afd-npu-4"
     assert states.dynamic_scales == "scales[:5]"
     assert states.expand_x_shared == "shared-hidden[:2]"
     assert states.dynamic_scales_shared == "shared-scales[:2]"
@@ -614,7 +691,14 @@ def test_async_ffn_work_item_uses_expert_counts_for_routed_tokens(monkeypatch):
         dtype=torch.int64,
     )
 
-    def fake_recv_attn_output(*, stage_idx, layer_idx, batch_size, ubatch_idx):
+    def fake_recv_attn_output(
+        *,
+        stage_idx,
+        layer_idx,
+        batch_size,
+        ubatch_idx,
+        transaction_id,
+    ):
         assert ubatch_idx == 0
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
@@ -646,6 +730,8 @@ def test_async_ffn_work_item_uses_expert_counts_for_routed_tokens(monkeypatch):
     work_item = connector.recv_ffn_work_item(
         stage_idx=0,
         max_num_tokens=16,
+        transaction_id="afd-npu-5",
+        layer_idx=23,
     )
 
     states = work_item.context.states
@@ -678,7 +764,14 @@ def test_async_send_ffn_work_item_output_preserves_all_shared_passthrough(
 
     monkeypatch.setattr(connector, "send_ffn_output", fake_send_ffn_output)
 
-    def fake_recv_attn_output(*, stage_idx, layer_idx, batch_size, ubatch_idx):
+    def fake_recv_attn_output(
+        *,
+        stage_idx,
+        layer_idx,
+        batch_size,
+        ubatch_idx,
+        transaction_id,
+    ):
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=stage_idx,
@@ -709,6 +802,8 @@ def test_async_send_ffn_work_item_output_preserves_all_shared_passthrough(
     work_item = connector.recv_ffn_work_item(
         stage_idx=0,
         max_num_tokens=16,
+        transaction_id="afd-npu-6",
+        layer_idx=7,
     )
     sent_output = connector.send_ffn_work_item_output(
         work_item,

@@ -136,6 +136,7 @@ class RemoteFFNProxy(nn.Module):
             layer_idx=self.layer_idx,
             stage_idx=stage_idx,
             seq_len=int(hidden_states.shape[0]),
+            transaction_id=afd_metadata.transaction_id,
         )
         context = AFDTransferContext(metadata=metadata)
         afd_metadata.connector.send_attn_output(

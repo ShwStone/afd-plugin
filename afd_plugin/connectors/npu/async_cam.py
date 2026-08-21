@@ -57,6 +57,7 @@ from afd_plugin.connectors.metadata import (
     AFDTransferState,
 )
 from afd_plugin.distributed import init_afd_process_group
+from afd_plugin.observability import create_afd_correlation_trace_recorder
 
 if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
@@ -68,6 +69,10 @@ ATTN_RANKS_PER_DP_CONFIG_KEY = "attn_ranks_per_dp"
 ASYNC_MOE_NUM_STAGES = 2
 ASYNC_MOE_REQUEST_SPLIT = "request"
 ASYNC_MOE_TOKEN_SPLIT = "token"
+CAM_DISPATCH_SEND_TRACE_EVENT = "afd.cam.dispatch_send"
+CAM_DISPATCH_RECV_TRACE_EVENT = "afd.cam.dispatch_recv"
+CAM_COMBINE_SEND_TRACE_EVENT = "afd.cam.combine_send"
+CAM_COMBINE_RECV_TRACE_EVENT = "afd.cam.combine_recv"
 
 _AFD_ASYNC_EXTRA_CONFIG_FIELDS: Final[frozenset[str]] = frozenset(
     {
@@ -268,6 +273,12 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             int,
             list[tuple[AFDTransferContext, Tensor, Tensor]],
         ] = {}
+        self.trace_recorder = create_afd_correlation_trace_recorder(
+            role=afd_config.role,
+            rank=rank,
+            role_rank=role_rank,
+            local_rank=local_rank,
+        )
 
     @property
     def is_initialized(self) -> bool:
@@ -306,15 +317,18 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
 
     def close(self) -> None:
         """Destroy the HCCL process group and clear pending transfer states."""
-        if self.cam_pg is not None:
-            import torch.distributed as dist
+        try:
+            self.trace_recorder.close()
+        finally:
+            if self.cam_pg is not None:
+                import torch.distributed as dist
 
-            dist.destroy_process_group(self.cam_pg)
-        self.cam_pg = None
-        self.comm_args = None
-        self._placeholder = None
-        self._pending_attention_payloads.clear()
-        self._initialized = False
+                dist.destroy_process_group(self.cam_pg)
+            self.cam_pg = None
+            self.comm_args = None
+            self._placeholder = None
+            self._pending_attention_payloads.clear()
+            self._initialized = False
 
     def select_experts(self, **kwargs: Any) -> tuple[Tensor, Tensor]:
         """Run the pinned vLLM-Ascend expert selector on Attention."""
@@ -327,6 +341,8 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         *,
         stage_idx: int,
         max_num_tokens: int,
+        transaction_id: str,
+        layer_idx: int,
     ) -> AFDAsyncFFNWorkItem:
         """Receive and normalize one connector-driven FFN dispatch item.
 
@@ -335,9 +351,10 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         """
         recv_output = self.recv_attn_output(
             stage_idx=stage_idx,
-            layer_idx=0,
+            layer_idx=layer_idx,
             batch_size=max(1, self.max_seq_len or max_num_tokens),
             ubatch_idx=stage_idx,
+            transaction_id=transaction_id,
         )
         context = recv_output.context
         metadata = context.metadata
@@ -353,7 +370,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         # received no routed tokens in this dispatch.  Such ranks must still
         # enter combine-send (the zero-token fallback below supplies its
         # placeholder) so every participant completes the CAM collective.
-        layer_idx = int(token_nums_rankid_layeridx[2].item())
+        received_layer_idx = int(token_nums_rankid_layeridx[2].item())
 
         expert_token_nums_shared = states.expert_token_nums_shared
         if expert_token_nums_shared is None:
@@ -374,7 +391,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             int(expert_token_nums.to(torch.int64).sum().item()),
         )
 
-        metadata.layer_idx = layer_idx
+        metadata.layer_idx = received_layer_idx
         metadata.stage_idx = stage_idx
         metadata.seq_lens = [num_tokens]
 
@@ -392,7 +409,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             hidden_states=hidden_states,
             context=context,
             recv_output=recv_output,
-            layer_idx=layer_idx,
+            layer_idx=received_layer_idx,
             stage_idx=stage_idx,
             num_tokens=num_tokens,
             total_num_tokens=total_num_tokens,
@@ -531,25 +548,38 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        torch.ops.umdk_cam_op_lib.async_dispatch_send(
-            hidden_states,
-            topk_ids,
-            self.comm_args,
-            self.comm_id,
-            self.max_seq_len,
-            states.batch_size,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            states.layer_idx,
-            self.tp_size,
-            self.dynamic_quant,
-            self.group_name,
+        flow_id = self.trace_recorder.make_flow_id(
+            metadata.transaction_id,
+            layer_idx=metadata.layer_idx,
+            stage_idx=metadata.stage_idx,
         )
+        with self.trace_recorder.record_range(
+            CAM_DISPATCH_SEND_TRACE_EVENT,
+            flow_id=flow_id,
+            transaction_id=metadata.transaction_id,
+            layer_idx=metadata.layer_idx,
+            stage_idx=metadata.stage_idx,
+            num_tokens=metadata.total_tokens,
+        ):
+            torch.ops.umdk_cam_op_lib.async_dispatch_send(
+                hidden_states,
+                topk_ids,
+                self.comm_args,
+                self.comm_id,
+                self.max_seq_len,
+                states.batch_size,
+                states.hidden_size,
+                states.topk,
+                self.ffn_size,
+                self.attn_size,
+                self.expert_per_rank,
+                self.world_rank,
+                self.topology.world_size,
+                states.layer_idx,
+                self.tp_size,
+                self.dynamic_quant,
+                self.group_name,
+            )
         return None
 
     def recv_ffn_output(
@@ -631,22 +661,36 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             world_size=self.topology.world_size,
             group_name=self.group_name,
         )
-        output = torch.ops.umdk_cam_op_lib.async_combine_recv(
-            placeholder,
-            topk_ids,
-            topk_weights,
-            self.comm_args,
-            self.comm_id,
-            states.batch_size,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.group_name,
+        metadata = context.metadata
+        flow_id = self.trace_recorder.make_flow_id(
+            metadata.transaction_id,
+            layer_idx=metadata.layer_idx,
+            stage_idx=metadata.stage_idx,
         )
+        with self.trace_recorder.record_range(
+            CAM_COMBINE_RECV_TRACE_EVENT,
+            flow_id=flow_id,
+            transaction_id=metadata.transaction_id,
+            layer_idx=metadata.layer_idx,
+            stage_idx=metadata.stage_idx,
+            num_tokens=metadata.total_tokens,
+        ):
+            output = torch.ops.umdk_cam_op_lib.async_combine_recv(
+                placeholder,
+                topk_ids,
+                topk_weights,
+                self.comm_args,
+                self.comm_id,
+                states.batch_size,
+                states.hidden_size,
+                states.topk,
+                self.ffn_size,
+                self.attn_size,
+                self.expert_per_rank,
+                self.world_rank,
+                self.topology.world_size,
+                self.group_name,
+            )
         _log_cam_op_values("async_combine_recv", "outputs", output=output)
         return output
 
@@ -665,10 +709,12 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self._require_initialized()
         batch_size = int(kwargs.get("batch_size", self.max_seq_len) or 1)
         layer_idx = int(kwargs.get("layer_idx", 0) or 0)
+        transaction_id = kwargs.get("transaction_id")
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=ubatch_idx,
             seq_lens=[batch_size],
+            transaction_id=transaction_id,
         )
         states = AFDAsyncTransferState(
             batch_size=batch_size,
@@ -699,22 +745,35 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        outputs = torch.ops.umdk_cam_op_lib.async_dispatch_recv(
-            placeholder,
-            self.comm_args,
-            self.comm_id,
-            states.batch_size,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.tp_size,
-            self.dynamic_quant,
-            self.group_name,
+        flow_id = self.trace_recorder.make_flow_id(
+            metadata.transaction_id,
+            layer_idx=metadata.layer_idx,
+            stage_idx=metadata.stage_idx,
         )
+        with self.trace_recorder.record_range(
+            CAM_DISPATCH_RECV_TRACE_EVENT,
+            flow_id=flow_id,
+            transaction_id=metadata.transaction_id,
+            layer_idx=metadata.layer_idx,
+            stage_idx=metadata.stage_idx,
+            num_tokens=metadata.total_tokens,
+        ):
+            outputs = torch.ops.umdk_cam_op_lib.async_dispatch_recv(
+                placeholder,
+                self.comm_args,
+                self.comm_id,
+                states.batch_size,
+                states.hidden_size,
+                states.topk,
+                self.ffn_size,
+                self.attn_size,
+                self.expert_per_rank,
+                self.world_rank,
+                self.topology.world_size,
+                self.tp_size,
+                self.dynamic_quant,
+                self.group_name,
+            )
         (
             hidden_states,
             expand_x_shared,
@@ -789,23 +848,38 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             tp_size=self.tp_size,
             group_name=self.group_name,
         )
-        torch.ops.umdk_cam_op_lib.async_combine_send(
-            ffn_output,
-            expand_x_shared,
-            self.comm_args,
-            token_nums_rankid_layeridx,
-            self.comm_id,
-            states.batch_size,
-            states.hidden_size,
-            states.topk,
-            self.ffn_size,
-            self.attn_size,
-            self.expert_per_rank,
-            self.world_rank,
-            self.topology.world_size,
-            self.tp_size,
-            self.group_name,
+        metadata = context.metadata
+        flow_id = self.trace_recorder.make_flow_id(
+            metadata.transaction_id,
+            layer_idx=metadata.layer_idx,
+            stage_idx=metadata.stage_idx,
         )
+        with self.trace_recorder.record_range(
+            CAM_COMBINE_SEND_TRACE_EVENT,
+            flow_id=flow_id,
+            transaction_id=metadata.transaction_id,
+            layer_idx=metadata.layer_idx,
+            stage_idx=metadata.stage_idx,
+            num_tokens=metadata.total_tokens,
+        ):
+            torch.ops.umdk_cam_op_lib.async_combine_send(
+                ffn_output,
+                expand_x_shared,
+                self.comm_args,
+                token_nums_rankid_layeridx,
+                self.comm_id,
+                states.batch_size,
+                states.hidden_size,
+                states.topk,
+                self.ffn_size,
+                self.attn_size,
+                self.expert_per_rank,
+                self.world_rank,
+                self.topology.world_size,
+                self.tp_size,
+                self.group_name,
+            )
+
     def _require_initialized(self) -> None:
         if not self._initialized:
             raise RuntimeError("CAMAsyncAFDConnector is not initialized")

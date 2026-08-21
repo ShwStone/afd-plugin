@@ -1517,10 +1517,21 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
     )
     runner = _new_ffn_runner()
     runner.vllm_config = _vllm_config(role="ffn")
-    runner.connector = SimpleNamespace(control_plane=None)
+    runner.connector = SimpleNamespace(
+        control_plane=None,
+        extra_info=SimpleNamespace(
+            async_moe_ubatching=False,
+            async_moe_num_ubatches=2,
+        ),
+        trace_recorder=SimpleNamespace(
+            make_flow_id=lambda *_args, **_kwargs: None,
+            record_range=lambda *_args, **_kwargs: nullcontext(),
+        ),
+    )
     runner.model = _RecordingFakeModel()
     runner.num_layers = 1
     runner.max_num_tokens = 16
+    runner._afd_connector_work_item_counter = 9
     metadata = AFDTransferMetadata.create_ffn_metadata(
         layer_idx=7,
         stage_idx=0,
@@ -1552,9 +1563,17 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
         shared_num_tokens=2,
     )
 
-    def recv_ffn_work_item(*, stage_idx, max_num_tokens):
+    def recv_ffn_work_item(
+        *,
+        stage_idx,
+        max_num_tokens,
+        transaction_id,
+        layer_idx,
+    ):
         assert stage_idx == 0
         assert max_num_tokens == 16
+        assert transaction_id == "afd-npu-9"
+        assert layer_idx == 0
         return work_item
 
     def send_ffn_work_item_output(sent_work_item, ffn_output):
@@ -1564,7 +1583,10 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
     runner.connector.recv_ffn_work_item = recv_ffn_work_item
     runner.connector.send_ffn_work_item_output = send_ffn_work_item_output
 
-    runner._ffn_forward_connector_driven()
+    runner._ffn_forward_connector_driven(
+        layer_indices=[0],
+        num_stages=1,
+    )
 
     assert runner.model.calls == [
         (
@@ -1581,6 +1603,68 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
     assert sent_outputs == [(work_item, "npu-ffn(hidden[:5], layer=7)")]
     assert context_calls[0]["num_tokens"] == 5
     assert context_calls[0]["afd_metadata"].tokens_lens == [5]
+
+
+def test_npu_ffn_trace_identity_keeps_two_stages_in_one_transaction():
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
+
+    runner = object.__new__(AFDNPUFFNModelRunner)
+    runner._afd_connector_work_item_counter = 0
+    layer_indices = [3, 5]
+
+    identities = [
+        runner._next_afd_trace_transfer_identity(
+            layer_indices,
+            num_stages=2,
+        )
+        for _ in range(5)
+    ]
+
+    assert identities == [
+        ("afd-npu-0", 3, 0),
+        ("afd-npu-0", 3, 1),
+        ("afd-npu-0", 5, 0),
+        ("afd-npu-0", 5, 1),
+        ("afd-npu-1", 3, 0),
+    ]
+
+
+def test_npu_ffn_profiler_steps_once_per_two_stage_transaction(monkeypatch):
+    _require_npu_runtime()
+    from afd_plugin.v1.worker.npu import ffn_model_runner
+
+    runner = object.__new__(ffn_model_runner.AFDNPUFFNModelRunner)
+    runner.connector = SimpleNamespace(
+        control_plane=None,
+        extra_info=SimpleNamespace(
+            async_moe_ubatching=True,
+            async_moe_num_ubatches=2,
+        ),
+    )
+    runner.prof = object()
+    runner.num_layers = 2
+    runner.afd_config = SimpleNamespace(compute_gate_on_attention=False)
+    runner._afd_connector_work_item_counter = 0
+    profiler_steps = []
+
+    def fake_forward(*, layer_indices, num_stages):
+        assert layer_indices == [0, 1]
+        assert num_stages == 2
+        runner._afd_connector_work_item_counter += len(layer_indices)
+
+    runner._ffn_forward_connector_driven = fake_forward
+    monkeypatch.setattr(
+        ffn_model_runner,
+        "step_afd_npu_profiler",
+        lambda profiler: profiler_steps.append(profiler),
+    )
+
+    runner.execute_connector_driven_step()
+    runner.execute_connector_driven_step()
+    runner.execute_connector_driven_step()
+
+    assert profiler_steps == [runner.prof, runner.prof]
 
 
 def test_npu_ffn_runner_sends_structured_shared_output(monkeypatch):
