@@ -13,11 +13,13 @@ contains, side by side and already time-aligned:
 
 Each MSTX marker enqueues exactly one device op, so pairing the two lists by
 monotonic ts (FIFO) is an exact 1:1 match.  This script turns that pairing into
-Chrome flow arrows (``ph`` "s"/"t") that connect the *correlation* marker to the
+Chrome flow arrows (``ph`` "s"/"f") that connect the *correlation* marker to the
 *device* op, using the same ``bp: "e"`` convention as the correlation flows so
-they render in Perfetto / chrome://tracing.
+they render in Perfetto / chrome://tracing.  Both endpoints use the same name,
+category, and ID because all three fields are part of the legacy flow identity.
 
-Usage::
+The merge tool invokes this linker automatically when profiler traces are
+provided.  The standalone command remains useful for already-merged traces::
 
     python3 -m tools.benchmarks.link_afd_device_flows \
         merged.json -o merged_with_device_flows.json
@@ -30,8 +32,8 @@ import json
 import re
 import sys
 from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 _MSTX_PATTERN = re.compile(r"^(?P<event>afd\.[^ ]+) flow_id=(?P<flow_id>[0-9a-f]+)$")
 
@@ -43,6 +45,7 @@ EVENT_TO_DEVICE_OP: dict[str, str] = {
     "afd.cam.dispatch_recv": "CamMoeDistributeDispatchRecv",
     "afd.cam.combine_send": "CamMoeDistributeCombineSend",
 }
+DEVICE_FLOW_CATEGORY = "afd.device-flow"
 
 # First id reserved for device-op flows; the merge tool's correlation flows use
 # small sequential ids, so start well above them to avoid collisions.
@@ -50,7 +53,7 @@ _ID_BASE = 1_000_000
 
 
 def _load_events(path: Path) -> list[dict[str, object]]:
-    with open(path, "rt", encoding="utf-8") as input_file:
+    with open(path, encoding="utf-8") as input_file:
         payload = json.load(input_file)
     events = payload.get("traceEvents") if isinstance(payload, dict) else payload
     if not isinstance(events, list):
@@ -85,7 +88,7 @@ def _pair_fifo(
                 f"{min(len(markers), len(ops))} by FIFO",
                 file=sys.stderr,
             )
-        for marker, op in zip(markers, ops):
+        for marker, op in zip(markers, ops, strict=False):
             flow_id = _flow_id_of_mstx(str(marker.get("name", "")))
             if flow_id is None:
                 continue
@@ -120,7 +123,7 @@ def _flow_endpoint(
 ) -> dict[str, object]:
     return {
         "name": name,
-        "cat": "afd.device-flow",
+        "cat": DEVICE_FLOW_CATEGORY,
         "ph": phase,
         "id": chrome_flow_id,
         "bp": "e",
@@ -158,6 +161,10 @@ def build_device_flows(
             continue
 
         chrome_flow_id = _ID_BASE + linked
+        # Legacy Chrome/Perfetto flows are keyed by category + name + ID.
+        # Keep the descriptive endpoint names on their enclosing slices and
+        # give both synthetic flow endpoints one shared flow name.
+        flow_name = f"{event_name} -> {device_op['name']}"
         # Arrow always points forward in time: earlier endpoint is "s".
         corr_ts = float(corr_event["ts"])
         dev_ts = float(device_op["ts"])
@@ -167,7 +174,7 @@ def build_device_flows(
             source, target = device_op, corr_event
         flows.append(
             _flow_endpoint(
-                name=str(source["name"]),
+                name=flow_name,
                 flow_id=flow_id,
                 chrome_flow_id=chrome_flow_id,
                 phase="s",
@@ -178,7 +185,7 @@ def build_device_flows(
         )
         flows.append(
             _flow_endpoint(
-                name=str(target["name"]),
+                name=flow_name,
                 flow_id=flow_id,
                 chrome_flow_id=chrome_flow_id,
                 phase="f",
@@ -203,11 +210,15 @@ def main(argv: Iterable[str]) -> int:
     parser.add_argument("-o", "--output", type=Path, required=True)
     args = parser.parse_args(list(argv))
 
-    events = _load_events(args.merged)
+    events = [
+        event
+        for event in _load_events(args.merged)
+        if event.get("cat") != DEVICE_FLOW_CATEGORY
+    ]
     flows, report = build_device_flows(events)
 
     payload = {"traceEvents": events + flows, "displayTimeUnit": "us"}
-    with open(args.output, "wt", encoding="utf-8") as output_file:
+    with open(args.output, "w", encoding="utf-8") as output_file:
         json.dump(payload, output_file)
 
     print(json.dumps(report, indent=2))

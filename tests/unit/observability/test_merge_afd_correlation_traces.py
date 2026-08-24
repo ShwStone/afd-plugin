@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from tools.benchmarks.merge_afd_correlation_traces import (
@@ -88,7 +89,7 @@ def test_best_clock_sample_selects_minimum_round_trip() -> None:
     assert uncertainty_ns == 5
 
 
-def test_merge_correlates_complete_cross_host_flow() -> None:
+def test_merge_correlates_complete_cross_host_flow(tmp_path: Path) -> None:
     attention = _sidecar(
         path="attention.jsonl",
         role="attention",
@@ -126,13 +127,74 @@ def test_merge_correlates_complete_cross_host_flow() -> None:
     }
 
     diagnostics = assign_clock_transforms([attention, ffn], [clock_sync])
-    trace, report = build_merged_trace([attention, ffn], [])
+    profiler_path = tmp_path / "attention-profiler.json"
+    profiler_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {
+                        "name": (
+                            "afd.cam.dispatch_send "
+                            "flow_id=abcdef0123456789"
+                        ),
+                        "cat": "mstx",
+                        "ph": "X",
+                        "pid": 10,
+                        "tid": 10,
+                        "ts": 5.0,
+                        "dur": 1.0,
+                    },
+                    {
+                        "name": "CamMoeDistributeDispatchSend",
+                        "cat": "npu",
+                        "ph": "X",
+                        "pid": 20,
+                        "tid": 20,
+                        "ts": 6.0,
+                        "dur": 1.0,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    trace, report = build_merged_trace(
+        [attention, ffn],
+        [(attention.path, profiler_path)],
+    )
 
     assert diagnostics[1]["uncertainty_ns"] == 5
     assert report["flows"]["total"] == 1
     assert report["flows"]["complete"] == 1
     assert report["flows"]["incomplete"] == []
+    assert report["device_flows"]["linked_device_flows"] == 1
     names = [event["name"] for event in trace["traceEvents"]]
     assert "afd.ffn.compute" in names
     assert any(event.get("ph") == "s" for event in trace["traceEvents"])
     assert any(event.get("ph") == "f" for event in trace["traceEvents"])
+
+    flow_events = [
+        event
+        for event in trace["traceEvents"]
+        if event.get("cat") == "afd.flow"
+    ]
+    flow_keys: dict[int, set[tuple[object, object, object]]] = {}
+    for event in flow_events:
+        flow_keys.setdefault(event["id"], set()).add(
+            (event["cat"], event["name"], event["id"])
+        )
+    assert flow_keys
+    assert all(len(keys) == 1 for keys in flow_keys.values())
+
+    device_flow_events = [
+        event
+        for event in trace["traceEvents"]
+        if event.get("cat") == "afd.device-flow"
+    ]
+    assert [event["ph"] for event in device_flow_events] == ["s", "f"]
+    assert len(
+        {
+            (event["cat"], event["name"], event["id"])
+            for event in device_flow_events
+        }
+    ) == 1

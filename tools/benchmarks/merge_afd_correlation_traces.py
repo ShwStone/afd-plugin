@@ -20,6 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+if __package__:
+    from .link_afd_device_flows import build_device_flows
+else:
+    from link_afd_device_flows import build_device_flows
+
 NANOSECONDS_PER_MICROSECOND: Final[int] = 1_000
 TRACE_SCHEMA_VERSION: Final[int] = 1
 FLOW_MARKER_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -292,6 +297,8 @@ def build_merged_trace(
         for event in sidecar.events
         if event.get("outcome") == "error"
     ]
+    device_flow_events, device_flow_report = build_device_flows(trace_events)
+    trace_events.extend(device_flow_events)
     report = {
         "schema_version": TRACE_SCHEMA_VERSION,
         "session_ids": sorted(
@@ -302,6 +309,7 @@ def build_merged_trace(
         "uncorrelated_events": uncorrelated_events,
         "error_events": error_events,
         "flows": flow_report,
+        "device_flows": device_flow_report,
         "profiler_traces": profiler_report,
     }
     return {"traceEvents": trace_events, "displayTimeUnit": "us"}, report
@@ -483,9 +491,25 @@ def _logical_flow_span(
                 "destination_event": destination_event,
             },
         )
+    # Legacy Chrome/Perfetto flows are keyed by category + name + ID. The
+    # endpoint slices retain their own event names; the synthetic endpoints
+    # need one shared name so the importer joins them into a visible arrow.
+    flow_name = f"{source_event} -> {destination_event}"
     return [
-        _chrome_flow_endpoint(source, chrome_flow_id, "s", origin_ns),
-        _chrome_flow_endpoint(destination, chrome_flow_id, "f", origin_ns),
+        _chrome_flow_endpoint(
+            source,
+            chrome_flow_id,
+            "s",
+            origin_ns,
+            flow_name=flow_name,
+        ),
+        _chrome_flow_endpoint(
+            destination,
+            chrome_flow_id,
+            "f",
+            origin_ns,
+            flow_name=flow_name,
+        ),
     ]
 
 
@@ -494,10 +518,12 @@ def _chrome_flow_endpoint(
     chrome_flow_id: int,
     phase: str,
     origin_ns: int,
+    *,
+    flow_name: str,
 ) -> dict[str, object]:
     sidecar, event, global_ns = entry
     return {
-        "name": event["event"],
+        "name": flow_name,
         "cat": "afd.flow",
         "ph": phase,
         "id": chrome_flow_id,
@@ -554,7 +580,7 @@ def _align_profiler_events(
             {
                 "sidecar": str(sidecar.path),
                 "status": "unaligned",
-                "reason": "no matching AFD record_function markers",
+                "reason": "no matching AFD MSTX markers",
             },
             0,
         )
