@@ -565,12 +565,17 @@ def phase_profile(
             "curl -s -X POST http://127.0.0.1:8000/start_profile || true",
         )
         time.sleep(5)
+    # All-DP collection passes dp_rank=-1: no pin header, the DP router
+    # spreads bursts across every replica so all ranks get profiled steps.
+    repeats = os.environ.get("FP_PROFILE_REPEATS", "4")
+    warmups = os.environ.get("FP_PROFILE_WARMUPS", "1")
+    suffix = "_alldp" if dp_rank < 0 else ""
     run_client_on_node0(
         "python3 -m tools.benchmarks.fixed_batch_client "
         "--base-url http://127.0.0.1:8000 "
         f"--dataset {MW_WORKLOADS}/{batch}.jsonl "
-        f"--dp-rank {dp_rank} --repeats 8 --warmups 2 "
-        f"--output {out_dir}/{batch}.profile_replay.json",
+        f"--dp-rank {dp_rank} --repeats {repeats} --warmups {warmups} "
+        f"--output {out_dir}/{batch}.profile_replay{suffix}.json",
         timeout=7200,
     )
     if system == "baseline":

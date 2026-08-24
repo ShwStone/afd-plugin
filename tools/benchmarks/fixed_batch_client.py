@@ -130,6 +130,7 @@ async def async_main(args: argparse.Namespace) -> dict[str, object]:
     # connection races the server's close -> instant ServerDisconnectedError
     # (observed on both systems, ~1 burst in 11).
     connector = aiohttp.TCPConnector(limit=len(batch) + 4, force_close=True)
+    dp_rank = None if args.dp_rank < 0 else args.dp_rank
     async with aiohttp.ClientSession(
         timeout=timeout,
         connector=connector,
@@ -137,13 +138,13 @@ async def async_main(args: argparse.Namespace) -> dict[str, object]:
         warmup_bursts = []
         for _ in range(args.warmups):
             warmup_bursts.append(
-                await run_burst(session, api_url, args.model, batch, args.dp_rank)
+                await run_burst(session, api_url, args.model, batch, dp_rank)
             )
             await asyncio.sleep(INTER_REPEAT_GAP_S)
         repeats = []
         for repeat_index in range(args.repeats):
             burst = await run_burst(
-                session, api_url, args.model, batch, args.dp_rank
+                session, api_url, args.model, batch, dp_rank
             )
             burst["repeat"] = repeat_index + 1
             repeats.append(burst)
@@ -184,7 +185,9 @@ def main() -> None:
     parser.add_argument("--endpoint", default="/v1/completions")
     parser.add_argument("--model", default="deepseek_v3_2")
     parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--dp-rank", type=int, default=0)
+    parser.add_argument("--dp-rank", type=int, default=0,
+                        help="DP replica to pin via X-data-parallel-rank; "
+                        "-1 = unpinned (router spreads across all DPs)")
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
