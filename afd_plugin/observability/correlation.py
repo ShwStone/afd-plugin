@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
 """Low-overhead correlation events for cross-role AFD profiling.
 
-The recorder is disabled by default. When enabled, it buffers scalar-only
-events in memory and writes one JSONL sidecar during connector shutdown. It
-never synchronizes an accelerator or inspects tensor values.
+The recorder is disabled by default. When enabled, it streams every event
+to a JSONL sidecar file immediately so that even a hard kill (SIGKILL)
+preserves all data written so far. ``close()`` only writes the final clock
+anchor and atomically renames the temp file. It never synchronizes an
+accelerator or inspects tensor values.
 """
 
 from __future__ import annotations
@@ -118,15 +120,44 @@ class AFDCorrelationTraceRecorder:
     ) -> None:
         self.config = config
         self.identity = identity
-        self._events: list[AFDCorrelationTraceEvent] = []
-        self._anchors: list[AFDClockAnchor] = []
         self._lock = threading.Lock()
         self._sequence = 0
         self._dropped_events = 0
         self._closed = False
         self._output_path: Path | None = None
-        if self.enabled:
-            self._anchors.append(_capture_clock_anchor("start"))
+        self._temp_file: TextIO | None = None
+        self._temp_path: Path | None = None
+        if not self.enabled:
+            return
+        output_path = self._build_output_path()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._temp_path = output_path.with_name(
+            output_path.name + TEMP_FILE_SUFFIX
+        )
+        # Open the sidecar file immediately and write the header
+        # records.  Every subsequent event is streamed to disk so that
+        # even a SIGKILL preserves everything written so far.
+        try:
+            self._temp_file = self._temp_path.open("w", encoding="utf-8")
+        except OSError:
+            self._temp_file = None
+            return
+        metadata = {
+            "record_type": "metadata",
+            "schema_version": AFD_TRACE_SCHEMA_VERSION,
+            "session_id": self.config.session_id,
+            "identity": asdict(self.identity),
+            "clock": "CLOCK_MONOTONIC_RAW",
+            "max_events": self.config.max_events,
+            "dropped_events": 0,
+        }
+        _write_json_line(self._temp_file, metadata)
+        start_anchor = _capture_clock_anchor("start")
+        _write_json_line(
+            self._temp_file,
+            {"record_type": "clock_anchor", **asdict(start_anchor)},
+        )
+        self._temp_file.flush()
 
     @property
     def enabled(self) -> bool:
@@ -168,32 +199,39 @@ class AFDCorrelationTraceRecorder:
         num_tokens: int | None = None,
         outcome: str | None = None,
     ) -> None:
-        """Append one event without touching accelerator state."""
+        """Append one event — streamed to the sidecar file immediately."""
 
         if not self.enabled:
             return
         with self._lock:
             if self._closed:
                 return
-            if len(self._events) >= self.config.max_events:
+            if self._sequence >= self.config.max_events:
                 self._dropped_events += 1
                 return
             sequence = self._sequence
             self._sequence += 1
-            self._events.append(
-                AFDCorrelationTraceEvent(
-                    sequence=sequence,
-                    monotonic_ns=_monotonic_raw_ns(),
-                    event=event,
-                    phase=phase,
-                    flow_id=flow_id,
-                    transaction_id=transaction_id,
-                    layer_idx=layer_idx,
-                    stage_idx=stage_idx,
-                    num_tokens=num_tokens,
-                    outcome=outcome,
-                ),
-            )
+            if self._temp_file is not None:
+                try:
+                    _write_json_line(
+                        self._temp_file,
+                        {
+                            "record_type": "event",
+                            "sequence": sequence,
+                            "monotonic_ns": _monotonic_raw_ns(),
+                            "event": event,
+                            "phase": phase,
+                            "flow_id": flow_id,
+                            "transaction_id": transaction_id,
+                            "layer_idx": layer_idx,
+                            "stage_idx": stage_idx,
+                            "num_tokens": num_tokens,
+                            "outcome": outcome,
+                        },
+                    )
+                    self._temp_file.flush()
+                except OSError:
+                    self._temp_file = None
 
     @contextmanager
     def record_range(
@@ -244,44 +282,32 @@ class AFDCorrelationTraceRecorder:
             )
 
     def close(self) -> Path | None:
-        """Flush buffered events once and return the sidecar path."""
+        """Finalize the sidecar and return its path.
 
+        Data is already on disk (streamed by every ``record()`` call), so
+        this only writes the closing clock anchor and renames the temp file.
+        """
         if not self.enabled:
             return None
         with self._lock:
             if self._closed:
                 return self._output_path
             self._closed = True
-            self._anchors.append(_capture_clock_anchor("stop"))
-            events = list(self._events)
-            anchors = list(self._anchors)
-            dropped_events = self._dropped_events
-
         output_path = self._build_output_path()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = output_path.with_name(output_path.name + TEMP_FILE_SUFFIX)
-        metadata = {
-            "record_type": "metadata",
-            "schema_version": AFD_TRACE_SCHEMA_VERSION,
-            "session_id": self.config.session_id,
-            "identity": asdict(self.identity),
-            "clock": "CLOCK_MONOTONIC_RAW",
-            "max_events": self.config.max_events,
-            "dropped_events": dropped_events,
-        }
-        with temporary_path.open("w", encoding="utf-8") as output_file:
-            _write_json_line(output_file, metadata)
-            for anchor in anchors:
+        if self._temp_file is not None:
+            try:
+                stop_anchor = _capture_clock_anchor("stop")
                 _write_json_line(
-                    output_file,
-                    {"record_type": "clock_anchor", **asdict(anchor)},
+                    self._temp_file,
+                    {"record_type": "clock_anchor", **asdict(stop_anchor)},
                 )
-            for event in events:
-                _write_json_line(
-                    output_file,
-                    {"record_type": "event", **asdict(event)},
-                )
-        os.replace(temporary_path, output_path)
+                self._temp_file.flush()
+                self._temp_file.close()
+            except OSError:
+                pass
+            self._temp_file = None
+        if self._temp_path is not None and self._temp_path.exists():
+            os.replace(self._temp_path, output_path)
         self._output_path = output_path
         return output_path
 
@@ -337,6 +363,28 @@ def _monotonic_raw_ns() -> int:
 
 
 def _record_function_context(marker: str) -> AbstractContextManager[object]:
+    # torch_npu's profiler does NOT record torch.autograd.profiler
+    # record_function names; it uses the MSTX user-range mechanism
+    # (torch_npu.npu.mstx) instead, gated by ExperimentalConfig(mstx=True).
+    # Use MSTX first so the marker name (including the flow_id suffix)
+    # actually lands in the torch_npu trace and the merge tool can align
+    # the device timeline to the correlation sidecar. mstx_range is a
+    # decorator, not a context manager, so pair range_start/range_end.
+    # Fall back to the torch CPU profiler API for non-NPU environments.
+    try:
+        import torch_npu
+
+        @contextmanager
+        def _mstx_range():
+            range_id = torch_npu.npu.mstx.range_start(marker)
+            try:
+                yield
+            finally:
+                torch_npu.npu.mstx.range_end(range_id)
+
+        return _mstx_range()
+    except (ImportError, AttributeError, RuntimeError, TypeError):
+        pass
     try:
         from torch.autograd.profiler import record_function
     except (ImportError, AttributeError):

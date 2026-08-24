@@ -82,6 +82,10 @@ def create_afd_npu_profiler(role: AFDNPUProfilerRole) -> AFDNPUProfiler | None:
         export_type=torch_npu.profiler.ExportType.Text,
         profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
         aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        # Record MSTX user ranges so the correlation markers (afd.cam.*
+        # with flow_id) land in the torch_npu trace; msprof export keeps
+        # them only when this flag is on (off by default).
+        mstx=True,
     )
     logger.info(
         "AFD NPU %s profiler enabled. Traces will be saved to: %s; with_stack=%s",
