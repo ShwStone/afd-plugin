@@ -26,13 +26,14 @@ When enabled, every process writes a scalar-only JSONL sidecar. Each event has:
   `afd.cam.dispatch_send`, `afd.cam.dispatch_recv`, `afd.ffn.compute`,
   `afd.cam.combine_send`, and `afd.cam.combine_recv`.
 
-The same range names and flow IDs are emitted through
-`torch.autograd.profiler.record_function`, so the sidecar can be aligned with
-the corresponding `torch_npu` trace. The recorder does not inspect tensors,
-copy tensor values to the CPU, synchronize the NPU, or modify CAM operator
-arguments. Sidecar begin/end intervals describe CPU-side enqueue and wait
-boundaries; use the aligned `torch_npu` device events, not sidecar duration, to
-measure kernel or communication execution time.
+The same range names and flow IDs are emitted as MSTX ranges, so the sidecar
+can be aligned with the corresponding `torch_npu` trace. The NPU profiler must
+enable MSTX collection; the AFD-owned profiler does this automatically. The
+recorder does not inspect tensors, copy tensor values to the CPU, synchronize
+the NPU, or modify CAM operator arguments. Sidecar begin/end intervals describe
+CPU-side enqueue and wait boundaries; use the aligned `torch_npu` device
+events, not sidecar duration, to measure kernel or communication execution
+time.
 
 For async CAM, Attention and FFN processes derive the same transaction ordinal
 from the ordered receive stream. The FFN side accounts for the configured
@@ -54,9 +55,11 @@ export AFD_TRACE_DIR=/path/shared-or-collected-later/afd-sidecars
 ```
 
 `AFD_TRACE_SESSION_ID` must be identical on every host and unique for one
-launch. `AFD_TRACE_MAX_EVENTS` optionally limits buffered events per process;
-the default is 200,000. Sidecars are written atomically when the connector
-closes. Shut the service down normally; `SIGKILL` cannot flush process memory.
+launch. `AFD_TRACE_MAX_EVENTS` optionally limits recorded events per process;
+the default is 200,000. Every event is immediately written and flushed to a
+temporary sidecar, so a hard kill preserves the completed prefix. Normal
+connector shutdown adds the final clock anchor and atomically renames the
+temporary file to `.jsonl`.
 
 Enable the existing NPU profilers for both roles with the same wait, warmup,
 active, and skip-first values. Correlation sidecars cover the whole process,
@@ -122,7 +125,8 @@ lists:
 - events without a flow ID and ranges that ended with an error;
 - incomplete flows and their missing phases;
 - flows whose cross-host order is reversed after clock correction; and
-- profiler traces that lack matching AFD markers.
+- profiler traces that lack matching AFD markers; and
+- correlation-to-device flow counts.
 
 To add raw `torch_npu` traces, map each trace to the exact sidecar produced by
 the same process:
@@ -141,6 +145,12 @@ AFD ranges and matching sidecar begin events. The report includes the spread of
 those marker differences. A large spread means the raw trace clock cannot be
 modeled as a constant shift and the merged device timeline should be treated as
 invalid.
+
+When profiler traces contain both MSTX markers and CANN
+`CamMoeDistribute*` operations, the merge tool also adds visible Perfetto flow
+arrows from each correlation range to the device operation it enqueues. The
+standalone `tools.benchmarks.link_afd_device_flows` command is only needed to
+upgrade a merged trace produced by an older version of the merge tool.
 
 If a host has no clock calibration file, the tool falls back to that host's
 realtime anchor and explicitly records that limitation. This is useful for a
