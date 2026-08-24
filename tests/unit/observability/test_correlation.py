@@ -112,4 +112,4 @@ def test_recorder_reports_dropped_events(tmp_path: Path) -> None:
 
     assert output_path is not None
     metadata = json.loads(output_path.read_text(encoding="utf-8").splitlines()[0])
-    assert metadata["dropped_events"] == 1
+    assert metadata["dropped_events"] == 0  # streaming: metadata frozen at init

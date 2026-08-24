@@ -530,6 +530,7 @@ def _align_profiler_events(
     for event in profiler_events:
         marker = FLOW_MARKER_PATTERN.match(str(event.get("name", "")))
         if marker is not None and "ts" in event:
+            # msprof exports ts AND dur in microseconds (epoch us for ts).
             marker_times[(marker["event"], marker["flow_id"])].append(
                 float(event["ts"]),
             )
@@ -567,6 +568,8 @@ def _align_profiler_events(
         event = dict(original)
         event["pid"] = pid_map[int(event.get("pid", 0))]
         if "ts" in event:
+            # ts and dur are both us (epoch us for ts); shift to the merged
+            # origin so device events sit on the correlation axis.
             event["ts"] = float(event["ts"]) + shift_us
         aligned.append(event)
     return (
