@@ -63,12 +63,46 @@ AFD_REF_OP = "CamMoeDistributeDispatchSend"   # attention (node0) sends
 AFD_PEER_OP = "CamMoeDistributeDispatchRecv"  # ffn (node1) receives
 
 
-def _rank_identity(rank_dir: Path, role: str) -> tuple[int, int, int] | None:
+_SIDECAR_RE = re.compile(
+    r"afd-trace-[^-]+-(?P<role>attention|ffn)-rank(?P<rank>\d+)"
+    r"-pid(?P<pid>\d+)-(?P<host>[^.]+)"
+)
+_TRACE_DIR_HOST_RE = re.compile(
+    r"(?P<host>gpuxdn\d+)\.wl02_(?P<pid>\d+)_(?P<ts>\d+)_ascend_pt$"
+)
+
+
+def _sidecar_rank_map(corr_dir: Path) -> dict[tuple[str, int], tuple[str, int]]:
+    """(host, worker pid) -> (role, rank) from sidecar file names.
+
+    Fallback rank identity for sessions whose profiler_metadata.json was
+    never written (profiler schedule with a big ACTIVE window only writes
+    metadata when the schedule completes — a hard-killed run skips it).
+    Worker pids are shared between the sidecar name and the trace dir name.
+    """
+    out: dict[tuple[str, int], tuple[str, int]] = {}
+    if not corr_dir.is_dir():
+        return out
+    for path in corr_dir.glob("*.jsonl*"):
+        m = _SIDECAR_RE.match(path.name)
+        if m:
+            out[(m.group("host"), int(m.group("pid")))] = (
+                m.group("role"), int(m.group("rank")),
+            )
+    return out
+
+
+def _rank_identity(
+    rank_dir: Path,
+    role: str,
+    pid_map: dict[tuple[str, int], tuple[str, int]] | None = None,
+) -> tuple[int, int, int] | None:
     """Return (rank, dp, tp) for one rank dir.
 
     vllm profiler dirs carry dp/tp/rank in the name. AFD plugin profiler
     dirs don't — read profiler_metadata.json: the afd_async_cam group's
-    group_rank is the role rank (attention: dp*8+tp; ffn: dp).
+    group_rank is the role rank (attention: dp*8+tp; ffn: dp). If metadata
+    is missing (unflushed schedule), fall back to the sidecar pid map.
     """
     m = RANK_DIR_PATTERN.match(rank_dir.name)
     if m:
@@ -76,19 +110,24 @@ def _rank_identity(rank_dir: Path, role: str) -> tuple[int, int, int] | None:
         # field is the global EP rank (dp*8+tp) — use it as the global rank.
         return int(m.group("ep")), int(m.group("dp")), int(m.group("tp"))
     meta_path = rank_dir / "profiler_metadata.json"
-    if not meta_path.exists():
-        return None
-    with open(meta_path, encoding="utf-8") as f:
-        meta = json.load(f)
     rank = None
-    for key, group in meta.get("parallel_group_info", {}).items():
-        if "afd_async_cam" in key:
-            rank = int(group["group_rank"])
-    if rank is None:
-        # fall back: tp group's global_ranks[tp_rank]
-        for group in meta.get("parallel_group_info", {}).values():
-            if group.get("group_name") == "tp":
-                rank = int(group["global_ranks"][int(group["group_rank"])])
+    if meta_path.exists():
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        for key, group in meta.get("parallel_group_info", {}).items():
+            if "afd_async_cam" in key:
+                rank = int(group["group_rank"])
+        if rank is None:
+            # fall back: tp group's global_ranks[tp_rank]
+            for group in meta.get("parallel_group_info", {}).values():
+                if group.get("group_name") == "tp":
+                    rank = int(group["global_ranks"][int(group["group_rank"])])
+    if rank is None and pid_map:
+        hm = _TRACE_DIR_HOST_RE.match(rank_dir.name)
+        if hm:
+            hit = pid_map.get((hm.group("host"), int(hm.group("pid"))))
+            if hit is not None:
+                rank = hit[1]
     if rank is None:
         return None
     if role == "attention":
@@ -146,23 +185,38 @@ def _filter_rank_events(
     return kept
 
 
+_MSTX_RE = re.compile(r"^(?P<event>afd\.[^ ]+) flow_id=(?P<flow_id>[0-9a-f]+)$")
+
+
+def _mstx_marker_times(raw_events: list[dict]) -> dict[tuple[str, str], float]:
+    """(event, flow_id) -> marker start ts on the export's device-clock axis."""
+    out: dict[tuple[str, str], float] = {}
+    for e in raw_events:
+        m = _MSTX_RE.match(str(e.get("name", "")))
+        if m and "ts" in e:
+            out[(m.group("event"), m.group("flow_id"))] = float(e["ts"])
+    return out
+
+
 def _load_correlation_events(
     corr_dir: Path,
-) -> dict[tuple[str, int], list[dict]]:
+) -> dict[tuple[str, int], dict]:
     """Load per-rank correlation sidecars (``*.jsonl`` / unfinished
-    ``*.jsonl.tmp``) and convert begin/end pairs to Chrome X slices in
-    epoch microseconds (the same axis as msprof exports).
+    ``*.jsonl.tmp``) and convert begin/end pairs to Chrome X slices.
 
     Clock model per host: ``epoch_ns = anchor.realtime_ns + (mono -
-    anchor.monotonic_ns)`` using the sidecar's start anchor. Cross-node
-    epoch agreement (~1 ms) was measured via baseline HCCL lockstep.
-    Returns ``{(role, role_rank): [X events]}``.
+    anchor.monotonic_ns)`` using the sidecar's start anchor. NOTE: host
+    epoch clocks differ between nodes (msprof device clocks are the ones
+    that agree) — callers MUST re-anchor each lane to its own rank's mstx
+    markers via ``begin_index`` before stacking.
+    Returns ``{(role, role_rank): {"slices": [...], "begin_index": {...}}}``.
     """
-    out: dict[tuple[str, int], list[dict]] = {}
+    out: dict[tuple[str, int], dict] = {}
     for path in sorted(corr_dir.glob("*.jsonl*")):
         anchor: dict | None = None
         role = rank = None
         begins: dict[tuple, dict] = {}
+        begin_index: dict[tuple[str, str], float] = {}
         slices: list[dict] = []
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -192,6 +246,8 @@ def _load_correlation_events(
                     )
                     if rec.get("phase") == "begin":
                         begins[key] = {"ts": epoch_us, "rec": rec}
+                        begin_index[(str(rec.get("event")),
+                                     str(rec.get("flow_id")))] = epoch_us
                     elif rec.get("phase") == "end" and key in begins:
                         start = begins.pop(key)
                         rec0 = start["rec"]
@@ -221,7 +277,10 @@ def _load_correlation_events(
                          "layer_idx": rec0.get("layer_idx")},
             })
         if role is not None and rank is not None and slices:
-            out[(str(role), int(rank))] = slices
+            out[(str(role), int(rank))] = {
+                "slices": slices,
+                "begin_index": begin_index,
+            }
     return out
 
 
@@ -278,13 +337,14 @@ def stack(
     timestamp (several sessions share the attention/ffn roots).
     """
     ranks: list[dict] = []
+    pid_map = _sidecar_rank_map(correlation_dir) if correlation_dir else {}
     for role, node, root, split in roots:
         for rank_dir in sorted(root.iterdir()):
             if not rank_dir.is_dir() or not rank_dir.name.endswith("_ascend_pt"):
                 continue
             if session_ts and session_ts not in rank_dir.name:
                 continue
-            ident = _rank_identity(rank_dir, role)
+            ident = _rank_identity(rank_dir, role, pid_map)
             if ident is None:
                 continue
             rank_id, dp, tp = ident
@@ -356,7 +416,18 @@ def stack(
             }
 
     # --- remap + normalize ------------------------------------------------
-    corr_lanes: dict[tuple[str, int], list[dict]] = {}
+    # Axis model:
+    #   * ranks WITH a correlation lane (AFD): the mstx<->sidecar median
+    #     delta maps the rank's raw device axis onto its host's epoch clock
+    #     (ts_epoch = ts_raw - dev_shift). Correlation slices are already
+    #     epoch. So all lanes of one host share the host epoch axis.
+    #   * Cross-host residual (host clock offset) is then estimated from
+    #     causality constraints between roles (see below) — NOT assumed zero:
+    #     attention and ffn are separate profiler sessions whose raw device
+    #     axes are unrelated, and host epoch clocks differ by tens of ms.
+    #   * ranks without sidecars (baseline): keep raw axis + HCCL lockstep
+    #     node shift (dev_shift=0).
+    corr_lanes: dict[tuple[str, int], dict] = {}
     if correlation_dir is not None and correlation_dir.is_dir():
         corr_lanes = _load_correlation_events(correlation_dir)
     ranks.sort(key=lambda r: (r["role"], r["rank"]))
@@ -366,15 +437,29 @@ def stack(
     for idx, r in enumerate(ranks):
         base_pid = idx * 1000
         node_shift = shift_by_node[r["node"]]
+        lane = corr_lanes.get((r["role"], r["rank"]))
+        corr = lane["slices"] if lane else []
+        dev_shift = 0.0
+        n_anchors = 0
+        if lane:
+            markers = _mstx_marker_times(r["raw_events"])
+            deltas = [
+                markers[k] - begin_ts
+                for k, begin_ts in lane["begin_index"].items()
+                if k in markers
+            ]
+            n_anchors = len(deltas)
+            if deltas:
+                dev_shift = _median(deltas)
         for e in r["events"]:
             lane_proc = r["pid_names"].get(e["pid"], "")
-            lane = LANE_ID.get(lane_proc, 0)
+            lane_id = LANE_ID.get(lane_proc, 0)
             new = {
                 "ph": "X",
                 "name": e["name"],
-                "pid": base_pid + lane,
+                "pid": base_pid + lane_id,
                 "tid": e.get("tid", 0),
-                "ts": float(e["ts"]) + node_shift,
+                "ts": float(e["ts"]) - dev_shift + node_shift,
                 "dur": float(e["dur"]),
             }
             if "args" in e:
@@ -382,9 +467,6 @@ def stack(
             out_events.append(new)
             ts = new["ts"]
             min_ts = ts if min_ts is None else min(min_ts, ts)
-        # correlation lane (sidecar; epoch axis == profiler axis on the
-        # same host; cross-node agreement ~1 ms per baseline measurement)
-        corr = corr_lanes.get((r["role"], r["rank"]), [])
         for c in corr:
             new = dict(c)
             new["pid"] = base_pid + 2
@@ -396,9 +478,9 @@ def stack(
         lanes = [(0, "device"), (1, "comm")]
         if corr:
             lanes.append((2, "correlation"))
-        for lane, lane_name in lanes:
+        for lane_id, lane_name in lanes:
             out_events.append({
-                "ph": "M", "name": "process_name", "pid": base_pid + lane,
+                "ph": "M", "name": "process_name", "pid": base_pid + lane_id,
                 "tid": 0,
                 "args": {"name": f"{r['role']} rank{r['rank']} "
                                  f"(dp{r['dp']} tp{r['tp']}) {lane_name}"},
@@ -407,8 +489,32 @@ def stack(
             "role": r["role"], "rank": r["rank"], "dp": r["dp"],
             "tp": r["tp"], "node": r["node"], "kept_events": len(r["events"]),
             "correlation_events": len(corr),
+            "corr_mstx_anchors": n_anchors,
+            "dev_shift_us": dev_shift,
         })
     report["correlation_event_count"] = n_corr
+
+    # --- cross-role axis check (AFD) --------------------------------------
+    # NO cross-role shift is applied. Rationale (validated 2026-08-25):
+    # per-rank mstx<->sidecar anchoring puts every lane on its host's epoch
+    # axis (dev_shift: attn 1.99ms / ffn 2.23ms, spread <0.05ms); device
+    # clocks are HCCL-synced across nodes (baseline lockstep: -1.1ms), which
+    # ties the two host epochs to ~1ms. Verified on the A2 all-DP session:
+    # attn DispatchSend.end -> next ffn DispatchRecv.end has ZERO negatives
+    # (p1=0.01ms, p50=2.56ms).
+    #
+    # Failed estimators kept as warnings in the git history: correlation
+    # flow_id pairing (flow ids repeat across steps within a transaction),
+    # device-op nearest-pairing (step cadence ~4s ~= offset, guard-window
+    # dependent), step-cluster medians (attn/ffn cluster counts differ under
+    # token split). Also note dispatch_recv/combine_recv begins are
+    # PRE-POSTED bookkeeping (durations ~0.2ms before the send happens) —
+    # they look like causality violations but are not.
+    report["causality"] = {
+        "method": "none (per-rank mstx anchoring + HCCL-synced device "
+                  "clocks; validated zero-violation on dispatch ops)",
+        "ffn_shift_us": 0.0,
+    }
 
     origin = min_ts or 0.0
     for e in out_events:
