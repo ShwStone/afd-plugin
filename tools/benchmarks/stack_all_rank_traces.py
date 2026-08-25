@@ -146,6 +146,85 @@ def _filter_rank_events(
     return kept
 
 
+def _load_correlation_events(
+    corr_dir: Path,
+) -> dict[tuple[str, int], list[dict]]:
+    """Load per-rank correlation sidecars (``*.jsonl`` / unfinished
+    ``*.jsonl.tmp``) and convert begin/end pairs to Chrome X slices in
+    epoch microseconds (the same axis as msprof exports).
+
+    Clock model per host: ``epoch_ns = anchor.realtime_ns + (mono -
+    anchor.monotonic_ns)`` using the sidecar's start anchor. Cross-node
+    epoch agreement (~1 ms) was measured via baseline HCCL lockstep.
+    Returns ``{(role, role_rank): [X events]}``.
+    """
+    out: dict[tuple[str, int], list[dict]] = {}
+    for path in sorted(corr_dir.glob("*.jsonl*")):
+        anchor: dict | None = None
+        role = rank = None
+        begins: dict[tuple, dict] = {}
+        slices: list[dict] = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue  # tail line may be truncated by a hard kill
+                rtype = rec.get("record_type")
+                if rtype == "metadata":
+                    identity = rec.get("identity", {})
+                    role = identity.get("role")
+                    rank = identity.get("role_rank")
+                elif rtype == "clock_anchor" and anchor is None:
+                    anchor = rec
+                elif rtype == "event" and anchor is not None:
+                    epoch_us = (
+                        anchor["realtime_ns"]
+                        + (rec["monotonic_ns"] - anchor["monotonic_ns"])
+                    ) / 1000.0
+                    key = (
+                        rec.get("event"), rec.get("flow_id"),
+                        rec.get("layer_idx"), rec.get("stage_idx"),
+                        rec.get("transaction_id"),
+                    )
+                    if rec.get("phase") == "begin":
+                        begins[key] = {"ts": epoch_us, "rec": rec}
+                    elif rec.get("phase") == "end" and key in begins:
+                        start = begins.pop(key)
+                        rec0 = start["rec"]
+                        slices.append({
+                            "ph": "X",
+                            "name": str(rec.get("event")),
+                            "ts": start["ts"],
+                            "dur": max(epoch_us - start["ts"], 1.0),
+                            "args": {
+                                "flow_id": rec.get("flow_id"),
+                                "num_tokens": rec0.get("num_tokens"),
+                                "layer_idx": rec0.get("layer_idx"),
+                                "stage_idx": rec0.get("stage_idx"),
+                                "transaction_id": rec0.get("transaction_id"),
+                            },
+                        })
+        # unmatched begins (hard kill mid-flight): emit as zero-dur marks
+        for start in begins.values():
+            rec0 = start["rec"]
+            slices.append({
+                "ph": "X",
+                "name": str(rec0.get("event")) + " (unmatched-begin)",
+                "ts": start["ts"],
+                "dur": 1.0,
+                "args": {"flow_id": rec0.get("flow_id"),
+                         "num_tokens": rec0.get("num_tokens"),
+                         "layer_idx": rec0.get("layer_idx")},
+            })
+        if role is not None and rank is not None and slices:
+            out[(str(role), int(rank))] = slices
+    return out
+
+
 def _op_starts(events: list[dict], pid_names: dict[int, str],
                name_sub: str | None, exact: str | None) -> list[float]:
     starts = []
@@ -188,6 +267,7 @@ def stack(
     min_dur_us: float,
     align_op: str,
     session_ts: str | None,
+    correlation_dir: Path | None = None,
 ) -> tuple[list[dict], dict]:
     """Merge all (role, node, trace_root, node_split_rank) inputs.
 
@@ -276,9 +356,13 @@ def stack(
             }
 
     # --- remap + normalize ------------------------------------------------
+    corr_lanes: dict[tuple[str, int], list[dict]] = {}
+    if correlation_dir is not None and correlation_dir.is_dir():
+        corr_lanes = _load_correlation_events(correlation_dir)
     ranks.sort(key=lambda r: (r["role"], r["rank"]))
     out_events: list[dict] = []
     min_ts = None
+    n_corr = 0
     for idx, r in enumerate(ranks):
         base_pid = idx * 1000
         node_shift = shift_by_node[r["node"]]
@@ -298,7 +382,21 @@ def stack(
             out_events.append(new)
             ts = new["ts"]
             min_ts = ts if min_ts is None else min(min_ts, ts)
-        for lane, lane_name in ((0, "device"), (1, "comm")):
+        # correlation lane (sidecar; epoch axis == profiler axis on the
+        # same host; cross-node agreement ~1 ms per baseline measurement)
+        corr = corr_lanes.get((r["role"], r["rank"]), [])
+        for c in corr:
+            new = dict(c)
+            new["pid"] = base_pid + 2
+            new["tid"] = 0
+            new["ts"] = float(c["ts"]) + node_shift
+            out_events.append(new)
+            n_corr += 1
+            min_ts = new["ts"] if min_ts is None else min(min_ts, new["ts"])
+        lanes = [(0, "device"), (1, "comm")]
+        if corr:
+            lanes.append((2, "correlation"))
+        for lane, lane_name in lanes:
             out_events.append({
                 "ph": "M", "name": "process_name", "pid": base_pid + lane,
                 "tid": 0,
@@ -308,7 +406,9 @@ def stack(
         report["ranks"].append({
             "role": r["role"], "rank": r["rank"], "dp": r["dp"],
             "tp": r["tp"], "node": r["node"], "kept_events": len(r["events"]),
+            "correlation_events": len(corr),
         })
+    report["correlation_event_count"] = n_corr
 
     origin = min_ts or 0.0
     for e in out_events:
@@ -346,6 +446,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--session-ts", default=None,
                         help="keep only rank dirs whose name contains this "
                         "capture timestamp prefix (e.g. 202608240723)")
+    parser.add_argument("--correlation-dir", type=Path, default=None,
+                        help="AFD correlation sidecar session dir "
+                        "(traces/correlation/<label>/<session_id>); adds a "
+                        "per-rank correlation lane with request metadata")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(list(argv))
 
@@ -356,7 +460,7 @@ def main(argv: list[str]) -> int:
         roots.append((args.peer_role, args.peer_node, args.peer_root, None))
 
     events, report = stack(roots, args.min_dur_us, args.align_op,
-                           args.session_ts)
+                           args.session_ts, args.correlation_dir)
     payload = {"traceEvents": events, "displayTimeUnit": "us"}
     if args.output.suffix == ".gz":
         with gzip.open(args.output, "wt", encoding="utf-8") as f:
