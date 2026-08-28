@@ -19,6 +19,7 @@ from afd_plugin.model_executor.npu.async_cam_ubatching import AsyncMoeStage
 
 ASYNC_MOE_UBATCH_METADATA_KEY: Final[str] = "afd_async_moe_ubatch_metadata"
 ASYNC_MOE_LAYOUT_LOG_ENV: Final[str] = "AFD_ASYNC_MOE_LAYOUT_LOG"
+_PAD_INPUT_ID: Final[int] = -1
 _TRUE_ENV_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
 
 logger = init_logger(__name__)
@@ -93,12 +94,17 @@ def get_async_moe_ubatch_metadata_from_forward_context(
 
 @dataclass
 class AsyncMoeStageInputs:
-    """TP-local tensors for the two global MoE stages."""
+    """TP-local tensors for the two global MoE stages.
+
+    Optional input IDs follow the same stage padding and TP-local token layout
+    as hidden states so model-specific routing cannot drift from execution.
+    """
 
     hidden_states: list[torch.Tensor]
     residuals: list[torch.Tensor | None]
     positions: list[torch.Tensor]
     llama_4_scaling: list[torch.Tensor | None]
+    input_ids: list[torch.Tensor] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,8 +247,20 @@ def build_async_moe_stage_inputs(
     positions: torch.Tensor,
     llama_4_scaling: torch.Tensor | None,
     metadata: AsyncMoeUbatchMetadata,
+    *,
+    input_ids: torch.Tensor | None = None,
 ) -> AsyncMoeStageInputs:
     """Convert the full model layout into per-stage Attention layouts."""
+
+    flat_input_ids = None
+    if input_ids is not None:
+        flat_input_ids = input_ids.reshape(-1)
+        if int(flat_input_ids.numel()) != metadata.parent_input_tokens:
+            raise ValueError(
+                "Async CAM input IDs must match the parent token layout: "
+                f"expected={metadata.parent_input_tokens}, "
+                f"actual={int(flat_input_ids.numel())}",
+            )
 
     if not metadata.use_sequence_parallel:
         return _build_replicated_stage_inputs(
@@ -251,6 +269,7 @@ def build_async_moe_stage_inputs(
             positions,
             llama_4_scaling,
             metadata,
+            flat_input_ids,
         )
 
     tp_group = get_tp_group()
@@ -312,6 +331,7 @@ def build_async_moe_stage_inputs(
     stage_residuals: list[torch.Tensor | None] = []
     stage_positions: list[torch.Tensor] = []
     stage_scaling: list[torch.Tensor | None] = []
+    stage_input_ids: list[torch.Tensor] = []
     for stage_slice in metadata.stages:
         stage_input_tokens = int(stage_slice.input_tokens)
         if stage_input_tokens % tp_size != 0:
@@ -375,11 +395,22 @@ def build_async_moe_stage_inputs(
                 )
             ),
         )
+        if flat_input_ids is not None:
+            stage_input_ids.append(
+                _slice_and_pad_token_dim(
+                    flat_input_ids,
+                    0,
+                    stage_slice.token_slice,
+                    stage_input_tokens,
+                    padding_value=_PAD_INPUT_ID,
+                )[local_stage_slice],
+            )
     return AsyncMoeStageInputs(
         hidden_states=stage_hidden_states,
         residuals=stage_residuals,
         positions=stage_positions,
         llama_4_scaling=stage_scaling,
+        input_ids=stage_input_ids if flat_input_ids is not None else None,
     )
 
 
@@ -447,6 +478,7 @@ def _build_replicated_stage_inputs(
     positions: torch.Tensor,
     llama_4_scaling: torch.Tensor | None,
     metadata: AsyncMoeUbatchMetadata,
+    input_ids: torch.Tensor | None,
 ) -> AsyncMoeStageInputs:
     global_input_tokens = metadata.parent_input_tokens
     if int(hidden_states.shape[0]) != global_input_tokens:
@@ -516,6 +548,20 @@ def _build_replicated_stage_inputs(
             )
             for stage in metadata.stages
         ],
+        input_ids=(
+            None
+            if input_ids is None
+            else [
+                _slice_and_pad_token_dim(
+                    input_ids,
+                    0,
+                    stage.token_slice,
+                    int(stage.input_tokens),
+                    padding_value=_PAD_INPUT_ID,
+                )
+                for stage in metadata.stages
+            ]
+        ),
     )
 
 
@@ -689,6 +735,8 @@ def _slice_and_pad_token_dim(
     token_dim: int,
     token_slice: slice,
     output_tokens: int,
+    *,
+    padding_value: int | float = 0,
 ) -> torch.Tensor:
     sliced_tensor = _slice_token_dim(tensor, token_dim, token_slice)
     current_tokens = int(sliced_tensor.shape[token_dim])
@@ -702,7 +750,7 @@ def _slice_and_pad_token_dim(
     padding_shape = list(sliced_tensor.shape)
     padding_shape[token_dim] = output_tokens - current_tokens
     return torch.cat(
-        (sliced_tensor, sliced_tensor.new_zeros(padding_shape)),
+        (sliced_tensor, sliced_tensor.new_full(padding_shape, padding_value)),
         dim=token_dim,
     )
 

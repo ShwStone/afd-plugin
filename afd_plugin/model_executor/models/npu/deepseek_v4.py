@@ -26,6 +26,7 @@ from afd_plugin.config import AFD_ASYNC_CONNECTOR, parse_afd_config
 from afd_plugin.connectors import AFDExpertRoutingSpec, AFDF2ATransferPayload
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
+    get_async_moe_ubatch_metadata_from_forward_context,
     prepare_cam_dispatch_payload,
     restore_cam_dispatch_output,
 )
@@ -144,12 +145,7 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Select DSV4 experts on Attention and exchange routed work via CAM."""
-        from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
-
-        topk_weights, topk_ids = deepseek_v4_attention_gate.compute_attention_gate_topk(
-            self,
-            hidden_states,
-        )
+        topk_weights, topk_ids = self.compute_topk(hidden_states)
         dispatch_payload = prepare_cam_dispatch_payload(
             hidden_states,
             topk_weights,
@@ -164,15 +160,28 @@ class AFDDeepseekV4AttentionGateRemoteMoE(RemoteFFNProxy):
         )
         return restore_cam_dispatch_output(output, dispatch_payload.layout)
 
+    def compute_topk(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select DSV4 experts without starting the CAM transfer."""
+        from afd_plugin.model_executor.models.npu import deepseek_v4_attention_gate
+
+        return deepseek_v4_attention_gate.compute_attention_gate_topk(
+            self,
+            hidden_states,
+        )
+
 
 class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
     """Role-local DSV4 decoder layer.
 
-    The inherited native ``forward`` is intentionally retained.  On the
+    The inherited native ``forward`` remains the unsplit path. On the
     Attention role it executes the full native HC/DSA sequence and the
     ``RemoteFFNProxy`` makes the AFD transfer at exactly the native FFN
-    boundary.  The FFN role is connector-driven and does not call this full
-    forward method; it invokes ``compute_ffn_output`` instead.
+    boundary. Async CAM ubatching uses the split hooks below so one model
+    invocation can interleave two stages. The FFN role is connector-driven
+    and invokes ``compute_ffn_output`` instead of the full layer forward.
     """
 
     def __init__(
@@ -263,6 +272,79 @@ class AFDDeepseekV4DecoderLayer(native.DeepseekV2DecoderLayer):
         self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+
+    # Upstream source: vllm-ascend commit 80d8c194f,
+    # DeepseekV2DecoderLayer.forward.
+    # Patch reason: native forward immediately enters the FFN, so Async CAM
+    # cannot keep one stage in flight while computing Attention for the other.
+    # Patch functionality: execute the native HC/DSA prefix through the FFN
+    # input and return the HC state needed to finish the layer after CAM recv.
+    # Signature: AFD-owned split-forward hook; it intentionally returns the
+    # native FFN input, pending HC state, and Attention-owned routing payload.
+    def compute_async_moe_attn_output(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        # ### PATCH START: split native DSV4 layer at the FFN boundary
+        residual = hidden_states.clone()
+        hidden_states, post, comb = self.hc_pre(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+        )
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            llama_4_scaling=llama_4_scaling,
+        )
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+
+        residual = hidden_states.clone()
+        hidden_states, post, comb = self.hc_pre(
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+        )
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        if not isinstance(self.mlp, AFDDeepseekV4AttentionGateRemoteMoE):
+            raise RuntimeError(
+                "DSV4 async MoE Attention execution requires the local gate "
+                "and remote FFN proxy",
+            )
+        topk_weights, topk_ids = self.mlp.compute_topk(hidden_states)
+        # ### PATCH END: split native DSV4 layer at the FFN boundary
+        return hidden_states, residual, post, comb, topk_weights, topk_ids
+
+    # Upstream source: vllm-ascend commit 80d8c194f,
+    # DeepseekV2DecoderLayer.forward.
+    # Patch reason: Async CAM receives the remote FFN result outside the native
+    # layer call after Attention for the other stage has run.
+    # Patch functionality: apply the native FFN hyper-connection post step.
+    # Signature: AFD-owned completion hook for compute_async_moe_attn_output.
+    def apply_async_moe_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        # ### PATCH START: complete split native DSV4 layer after CAM recv
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        # ### PATCH END: complete split native DSV4 layer after CAM recv
+        return hidden_states
 
     def compute_ffn_output(
         self,
@@ -420,6 +502,44 @@ class AFDDeepseekV4Model(native.DeepseekV4Model):
         self.aux_hidden_state_layers: tuple[int, ...] = ()
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
+        )
+
+    # Upstream source: vllm-ascend commit 80d8c194f,
+    # DeepseekV4Model.forward.
+    # Patch reason: the native model runs every layer serially and cannot
+    # schedule two Async CAM stages at the DSV4 FFN boundary.
+    # Patch functionality: route only planned Async CAM ubatches through the
+    # model-owned two-stage pipeline; all unsplit execution stays native.
+    # Signature: matches upstream; no added parameters.
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        # ### PATCH START: DSV4 model-owned Async CAM ubatch pipeline
+        if (
+            self.afd_config.connector == AFD_ASYNC_CONNECTOR
+            and get_async_moe_ubatch_metadata_from_forward_context() is not None
+        ):
+            from afd_plugin.model_executor.models.npu import (
+                deepseek_v4_async_cam_forward,
+            )
+
+            return deepseek_v4_async_cam_forward.run_model_forward(
+                self,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+            )
+        # ### PATCH END: DSV4 model-owned Async CAM ubatch pipeline
+        return super().forward(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
         )
 
     def compute_ffn_output(
