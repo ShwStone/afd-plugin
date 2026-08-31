@@ -283,6 +283,15 @@ hidden states together with `topk_weights`, `topk_ids`, and optional
 which permits CAM dispatch/combine overlap. Dense layers remain local to the
 Attention model path.
 
+Internal async Attention DP routing defaults to vLLM's request-count DPLB. The
+experimental `attention_dplb_policy="prefill_token_sum"` option publishes each
+scheduler's live unfinished prompt-token debt through the asynchronous
+coordinator stats path. The frontend routes eligible prefill-only text requests
+to the lowest debt, uses request count to break ties, and falls back globally
+to request-count DPLB when any debt is unavailable or stale. This policy does
+not enable synchronous DP waves, collectives, dummy batches, or `FIRST_REQ`
+wakeups.
+
 The optional `async_moe_ubatching` mode is distinct from vLLM native DBO. It:
 
 - requires `compute_gate_on_attention=true`;

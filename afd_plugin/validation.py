@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any, Final
 
-from afd_plugin.config import AFDConfig, parse_afd_config
+from afd_plugin.config import AFDConfig, parse_afd_config, parse_optional_afd_config
 from afd_plugin.v1.worker.cuda_graph import (
     cudagraph_mode_name,
     validate_cuda_graph_mode,
@@ -31,6 +31,37 @@ VLLM_GPU_WORKER_FQCN: Final[str] = "vllm.v1.worker.gpu_worker.Worker"
 VLLM_ASCEND_NPU_WORKER_FQCN: Final[str] = "vllm_ascend.worker.worker.NPUWorker"
 VLLM_ASCEND_310P_WORKER_FQCN: Final[str] = "vllm_ascend._310p.worker_310p.NPUWorker310"
 VLLM_ASCEND_XLITE_WORKER_FQCN: Final[str] = "vllm_ascend.xlite.xlite_worker.XliteWorker"
+
+
+def validate_attention_dplb_config(vllm_config: VllmConfig) -> None:
+    """Validate the opt-in async Attention prefill-token DPLB policy."""
+
+    afd_config = parse_optional_afd_config(vllm_config)
+    if (
+        afd_config is None
+        or afd_config.role != "attention"
+        or afd_config.attention_dplb_policy != "prefill_token_sum"
+    ):
+        return
+
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.data_parallel_size <= 1:
+        raise ValueError("prefill_token_sum DPLB requires data_parallel_size > 1")
+    if (
+        parallel_config.data_parallel_external_lb
+        or parallel_config.data_parallel_hybrid_lb
+    ):
+        raise ValueError("prefill_token_sum DPLB requires internal DP load balancing")
+    if parallel_config.enable_elastic_ep:
+        raise ValueError("prefill_token_sum DPLB does not support elastic EP")
+
+    scheduler_config = vllm_config.scheduler_config
+    if scheduler_config.policy != "fcfs":
+        raise ValueError("prefill_token_sum DPLB requires the FCFS scheduler policy")
+    if scheduler_config.scheduler_cls is not None:
+        raise ValueError("prefill_token_sum DPLB does not support a custom scheduler")
+    if vllm_config.speculative_config is not None:
+        raise ValueError("prefill_token_sum DPLB does not support speculative decoding")
 
 
 def validate_gpu_model_runner_v2_config(

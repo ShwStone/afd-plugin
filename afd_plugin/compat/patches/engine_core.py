@@ -21,16 +21,25 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
+from itertools import chain
 from typing import TYPE_CHECKING, Any
 
 import vllm.v1.engine.core as core_module
 
+from afd_plugin.compat.patches.async_dp_stats import (
+    AFD_DPLB_STATS_KEY,
+    AFD_DPLB_STATS_VERSION,
+    PREFILL_TOKEN_DEBT_MAX_LIVE_REQUESTS,
+    PREFILL_TOKEN_DEBT_REPORT_INTERVAL_S,
+)
 from afd_plugin.config import AFDConfig, is_afd_async_dp, parse_optional_afd_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.executor import Executor
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.request import Request
 
 
 # Patch reason: AFD FFN ranks run as connector daemons instead of normal
@@ -454,52 +463,167 @@ def run_busy_loop(self):
 
 
 def _run_async_attention_busy_loop(self) -> None:
-    """Run independent Attention steps while publishing native DPLB counts."""
+    """Run independent Attention steps while publishing asynchronous DPLB stats."""
 
+    afd_config = parse_optional_afd_config(self.vllm_config, validate=False)
+    publish_prefill_token_debt = bool(
+        afd_config is not None
+        and afd_config.role == "attention"
+        and afd_config.attention_dplb_policy == "prefill_token_sum"
+    )
     last_request_counts = (0, 0)
+    last_prefill_token_debt: int | None = None
+    last_token_debt_publish_time = 0.0
+    force_token_debt_publish = publish_prefill_token_debt
     while self._handle_shutdown():
         self._process_input_queue()
-        last_request_counts = _publish_async_attention_request_counts(
+        (
+            last_request_counts,
+            last_prefill_token_debt,
+            last_token_debt_publish_time,
+        ) = _publish_async_attention_load_stats(
             self,
             last_request_counts,
+            last_prefill_token_debt,
+            last_token_debt_publish_time,
+            publish_prefill_token_debt=publish_prefill_token_debt,
+            force_token_debt_publish=force_token_debt_publish,
         )
+        force_token_debt_publish = False
         self._process_engine_step()
-        last_request_counts = _publish_async_attention_request_counts(
+        (
+            last_request_counts,
+            last_prefill_token_debt,
+            last_token_debt_publish_time,
+        ) = _publish_async_attention_load_stats(
             self,
             last_request_counts,
+            last_prefill_token_debt,
+            last_token_debt_publish_time,
+            publish_prefill_token_debt=publish_prefill_token_debt,
         )
 
     raise SystemExit
 
 
-def _publish_async_attention_request_counts(
+def _publish_async_attention_load_stats(
     self,
     last_request_counts: tuple[int, int],
-) -> tuple[int, int]:
-    """Publish changed ``(running, waiting)`` counts to the DP coordinator."""
+    last_prefill_token_debt: int | None,
+    last_token_debt_publish_time: float,
+    *,
+    publish_prefill_token_debt: bool,
+    force_token_debt_publish: bool = False,
+) -> tuple[tuple[int, int], int | None, float]:
+    """Publish changed request counts and bounded-cadence prefill token debt."""
 
     if not self.publish_dp_lb_stats:
-        return last_request_counts
+        return (
+            last_request_counts,
+            last_prefill_token_debt,
+            last_token_debt_publish_time,
+        )
 
     request_counts = self.scheduler.get_request_counts()
-    if request_counts == last_request_counts:
-        return last_request_counts
+    request_counts_changed = request_counts != last_request_counts
+    prefill_token_debt = last_prefill_token_debt
+    now = time.monotonic()
+    token_debt_report_due = bool(
+        publish_prefill_token_debt
+        and (
+            force_token_debt_publish
+            or now - last_token_debt_publish_time
+            >= PREFILL_TOKEN_DEBT_REPORT_INTERVAL_S
+        )
+    )
+    if token_debt_report_due:
+        prefill_token_debt = _get_prefill_token_debt(self.scheduler)
+    elif publish_prefill_token_debt and request_counts_changed:
+        # Count changes can arrive much faster than the bounded queue-scan
+        # cadence. Invalidate token routing until the next fresh debt scan.
+        prefill_token_debt = 0 if request_counts == (0, 0) else None
+
+    if not request_counts_changed and not token_debt_report_due:
+        return (
+            last_request_counts,
+            last_prefill_token_debt,
+            last_token_debt_publish_time,
+        )
 
     num_running_reqs, num_waiting_reqs = request_counts
+    kv_connector_stats = None
+    if publish_prefill_token_debt:
+        kv_connector_stats = {
+            AFD_DPLB_STATS_KEY: {
+                "version": AFD_DPLB_STATS_VERSION,
+                "prefill_token_debt": prefill_token_debt,
+            }
+        }
+        last_prefill_token_debt = prefill_token_debt
+        if token_debt_report_due:
+            last_token_debt_publish_time = now
+
     scheduler_stats = core_module.SchedulerStats(
         num_running_reqs=num_running_reqs,
         num_waiting_reqs=num_waiting_reqs,
+        kv_connector_stats=kv_connector_stats,
     )
     self.output_queue.put_nowait(
         (-1, core_module.EngineCoreOutputs(scheduler_stats=scheduler_stats))
     )
     core_module.logger.debug(
-        "AFD async-DP engine %d published request counts: running=%d waiting=%d",
+        "AFD async-DP engine %d published load stats: running=%d waiting=%d "
+        "prefill_token_debt=%s",
         self.engine_index,
         num_running_reqs,
         num_waiting_reqs,
+        prefill_token_debt if publish_prefill_token_debt else "disabled",
     )
-    return request_counts
+    return request_counts, last_prefill_token_debt, last_token_debt_publish_time
+
+
+def _get_prefill_token_debt(scheduler: Scheduler) -> int | None:
+    """Return live unfinished prompt tokens, or ``None`` for mixed traffic."""
+
+    live_request_count = (
+        len(scheduler.waiting) + len(scheduler.skipped_waiting) + len(scheduler.running)
+    )
+    if live_request_count > PREFILL_TOKEN_DEBT_MAX_LIVE_REQUESTS:
+        return None
+
+    live_requests = chain(
+        scheduler.waiting,
+        scheduler.skipped_waiting,
+        scheduler.running,
+    )
+    prefill_token_debt = 0
+    for request in live_requests:
+        if not _request_supports_prefill_token_dplb(request):
+            return None
+        completed_tokens = request.num_computed_tokens - request.num_in_flight_tokens
+        prefill_token_debt += max(
+            request.num_prompt_tokens - completed_tokens,
+            0,
+        )
+    return prefill_token_debt
+
+
+def _request_supports_prefill_token_dplb(request: Request) -> bool:
+    sampling_params = request.sampling_params
+    return bool(
+        sampling_params is not None
+        and request.pooling_params is None
+        and sampling_params.max_tokens == 1
+        and sampling_params.n == 1
+        and sampling_params.structured_outputs is None
+        and request.prompt_token_ids is not None
+        and request.prompt_embeds is None
+        and not request.mm_features
+        and request.lora_request is None
+        and request.priority == 0
+        and not request.resumable
+        and not request.abort_immediately
+    )
 
 
 class _AFDFFNKVCacheConfig:

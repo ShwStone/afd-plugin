@@ -81,9 +81,15 @@ def _install_fake_vllm_core(monkeypatch: pytest.MonkeyPatch):
             return ("mm-cache", vllm_config)
 
     class _SchedulerStats:
-        def __init__(self, num_running_reqs=0, num_waiting_reqs=0):
+        def __init__(
+            self,
+            num_running_reqs=0,
+            num_waiting_reqs=0,
+            kv_connector_stats=None,
+        ):
             self.num_running_reqs = num_running_reqs
             self.num_waiting_reqs = num_waiting_reqs
+            self.kv_connector_stats = kv_connector_stats
 
     def get_kv_cache_configs(vllm_config, kv_cache_specs, available_gpu_memory):
         del vllm_config, available_gpu_memory
@@ -158,13 +164,21 @@ def _load_patch_module() -> types.ModuleType:
     return importlib.import_module(module_name)
 
 
-def _config(role: str, *, async_dp: bool = False):
+def _config(
+    role: str,
+    *,
+    async_dp: bool = False,
+    attention_dplb_policy: str = "request_count",
+):
     class Scheduler:
         connector = None
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.request_counts = (0, 0)
+            self.waiting = []
+            self.skipped_waiting = []
+            self.running = []
 
         def get_kv_connector(self):
             return None
@@ -200,7 +214,10 @@ def _config(role: str, *, async_dp: bool = False):
     def validate_block_size():
         cache_config.validated = True
 
-    afd_config: dict[str, object] = {"role": role}
+    afd_config: dict[str, object] = {
+        "role": role,
+        "attention_dplb_policy": attention_dplb_policy,
+    }
     if async_dp:
         afd_config.update(
             {
@@ -350,7 +367,129 @@ def test_async_attention_publishes_request_count_lifecycle_without_dp_waves(
         if destination == -1
     ]
     assert published_counts == [(1, 0), (0, 1), (0, 0)]
-    assert "AFD async-DP engine 2 published request counts" in caplog.text
+    assert "AFD async-DP engine 2 published load stats" in caplog.text
+
+
+def _prefill_request(
+    prompt_tokens: int,
+    *,
+    computed_tokens: int = 0,
+    in_flight_tokens: int = 0,
+    max_tokens: int = 1,
+):
+    return SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            max_tokens=max_tokens,
+            n=1,
+            structured_outputs=None,
+        ),
+        pooling_params=None,
+        prompt_token_ids=list(range(prompt_tokens)),
+        prompt_embeds=None,
+        mm_features=[],
+        lora_request=None,
+        priority=0,
+        resumable=False,
+        abort_immediately=False,
+        num_prompt_tokens=prompt_tokens,
+        num_computed_tokens=computed_tokens,
+        num_in_flight_tokens=in_flight_tokens,
+    )
+
+
+def test_prefill_token_debt_tracks_live_scheduler_progress(monkeypatch):
+    _install_fake_vllm_core(monkeypatch)
+    patch_module = _load_patch_module()
+    scheduler = SimpleNamespace(
+        waiting=[_prefill_request(100, computed_tokens=20)],
+        skipped_waiting=[_prefill_request(50)],
+        running=[_prefill_request(30, computed_tokens=40)],
+    )
+
+    assert patch_module._get_prefill_token_debt(scheduler) == 130
+
+    scheduler.running = [
+        _prefill_request(
+            100,
+            computed_tokens=80,
+            in_flight_tokens=30,
+        )
+    ]
+    scheduler.waiting = []
+    scheduler.skipped_waiting = []
+    assert patch_module._get_prefill_token_debt(scheduler) == 50
+
+    scheduler.running.append(_prefill_request(10, max_tokens=2))
+    assert patch_module._get_prefill_token_debt(scheduler) is None
+
+
+def test_prefill_token_debt_scan_is_bounded(monkeypatch):
+    _install_fake_vllm_core(monkeypatch)
+    patch_module = _load_patch_module()
+    request = _prefill_request(1)
+    scheduler = SimpleNamespace(
+        waiting=[request] * (patch_module.PREFILL_TOKEN_DEBT_MAX_LIVE_REQUESTS + 1),
+        skipped_waiting=[],
+        running=[],
+    )
+
+    assert patch_module._get_prefill_token_debt(scheduler) is None
+
+
+def test_prefill_token_debt_publishes_when_counts_do_not_change(monkeypatch):
+    core_module = _install_fake_vllm_core(monkeypatch)
+    patch_module = _load_patch_module()
+    request = _prefill_request(100)
+    scheduler = SimpleNamespace(
+        waiting=[],
+        skipped_waiting=[],
+        running=[request],
+        get_request_counts=lambda: (1, 0),
+    )
+    published = []
+    engine = SimpleNamespace(
+        publish_dp_lb_stats=True,
+        scheduler=scheduler,
+        engine_index=0,
+        output_queue=SimpleNamespace(
+            put_nowait=lambda output: published.append(output)
+        ),
+    )
+    now = 1.0
+    monkeypatch.setattr(patch_module.time, "monotonic", lambda: now)
+
+    state = patch_module._publish_async_attention_load_stats(
+        engine,
+        (0, 0),
+        None,
+        0.0,
+        publish_prefill_token_debt=True,
+        force_token_debt_publish=True,
+    )
+    request.num_computed_tokens = 40
+    now = 1.05
+    state = patch_module._publish_async_attention_load_stats(
+        engine,
+        *state,
+        publish_prefill_token_debt=True,
+    )
+    assert len(published) == 1
+
+    now = 1.11
+    state = patch_module._publish_async_attention_load_stats(
+        engine,
+        *state,
+        publish_prefill_token_debt=True,
+    )
+
+    assert state[1] == 60
+    assert len(published) == 2
+    token_stats = published[-1][1].scheduler_stats.kv_connector_stats
+    assert token_stats[patch_module.AFD_DPLB_STATS_KEY] == {
+        "version": patch_module.AFD_DPLB_STATS_VERSION,
+        "prefill_token_debt": 60,
+    }
+    assert core_module is sys.modules["vllm.v1.engine.core"]
 
 
 def test_engine_core_patch_runs_and_stops_ffn_loop(monkeypatch):
