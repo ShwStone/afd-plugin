@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -14,6 +17,7 @@ from afd_plugin.config import (
     parse_afd_config,
     parse_optional_afd_config,
 )
+from afd_plugin.validation import validate_attention_dplb_config
 
 
 def test_parse_empty_additional_config_is_inactive():
@@ -129,6 +133,106 @@ def test_async_dp_requires_async_connector():
                 },
             },
         )
+
+
+def test_attention_dplb_policy_defaults_to_request_count():
+    assert AFDConfig().attention_dplb_policy == "request_count"
+
+
+def test_prefill_token_dplb_policy_is_opt_in_for_async_cam():
+    config = parse_afd_config(
+        {
+            "afd": {
+                "connector": "CAMAsyncAFDConnector",
+                "role": "attention",
+                "async": True,
+                "attention_dplb_policy": "prefill_token_sum",
+            },
+        }
+    )
+
+    assert config.attention_dplb_policy == "prefill_token_sum"
+
+
+@pytest.mark.parametrize("policy", ["token", "wave", 1])
+def test_attention_dplb_policy_rejects_unknown_values(policy):
+    with pytest.raises(ValueError, match="attention_dplb_policy must be one of"):
+        afd_config_from_mapping({"attention_dplb_policy": policy})
+
+
+def test_prefill_token_dplb_policy_requires_async_cam():
+    with pytest.raises(ValueError, match="prefill_token_sum.*requires AFD async"):
+        afd_config_from_mapping({"attention_dplb_policy": "prefill_token_sum"})
+
+
+def test_prefill_token_dplb_policy_rejects_ffn_role():
+    with pytest.raises(ValueError, match="available only for the Attention role"):
+        afd_config_from_mapping(
+            {
+                "connector": "CAMAsyncAFDConnector",
+                "role": "ffn",
+                "async": True,
+                "attention_dplb_policy": "prefill_token_sum",
+            }
+        )
+
+
+def _prefill_token_dplb_vllm_config():
+    return SimpleNamespace(
+        additional_config={
+            "afd": {
+                "connector": "CAMAsyncAFDConnector",
+                "role": "attention",
+                "async": True,
+                "attention_dplb_policy": "prefill_token_sum",
+            }
+        },
+        parallel_config=SimpleNamespace(
+            data_parallel_size=2,
+            data_parallel_external_lb=False,
+            data_parallel_hybrid_lb=False,
+            enable_elastic_ep=False,
+        ),
+        scheduler_config=SimpleNamespace(
+            policy="fcfs",
+            scheduler_cls=None,
+        ),
+        speculative_config=None,
+    )
+
+
+def test_prefill_token_dplb_accepts_supported_vllm_config():
+    validate_attention_dplb_config(_prefill_token_dplb_vllm_config())
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value", "message"),
+    [
+        ("parallel_config", "data_parallel_size", 1, "data_parallel_size > 1"),
+        (
+            "parallel_config",
+            "data_parallel_external_lb",
+            True,
+            "internal DP load balancing",
+        ),
+        ("parallel_config", "enable_elastic_ep", True, "elastic EP"),
+        ("scheduler_config", "policy", "priority", "FCFS"),
+        ("scheduler_config", "scheduler_cls", object, "custom scheduler"),
+        ("config", "speculative_config", object(), "speculative decoding"),
+    ],
+)
+def test_prefill_token_dplb_rejects_unsupported_vllm_config(
+    target,
+    field,
+    value,
+    message,
+):
+    config = _prefill_token_dplb_vllm_config()
+    owner = config if target == "config" else getattr(config, target)
+    setattr(owner, field, value)
+
+    with pytest.raises(ValueError, match=message):
+        validate_attention_dplb_config(config)
 
 
 def test_original_common_afd_field_aliases_are_supported():

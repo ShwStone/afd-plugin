@@ -19,7 +19,10 @@ import vllm.engine.arg_utils as arg_utils_module
 
 from afd_plugin.compat.vllm import TARGET_VLLM_VERSION
 from afd_plugin.config import parse_optional_afd_config
-from afd_plugin.validation import afd_worker_qualname_for_platform_default
+from afd_plugin.validation import (
+    afd_worker_qualname_for_platform_default,
+    validate_attention_dplb_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -111,7 +114,8 @@ def create_engine_config(
 # Patch reason: EngineCore handshakes explicitly rerun VllmConfig.__post_init__
 # after the config's actual AFD all2all backend has been restored.
 # Patch functionality: temporarily presents a validation-safe backend during
-# explicit AFD ubatching revalidation, then restores the actual backend.
+# explicit AFD ubatching revalidation, restores the actual backend, and
+# validates the opt-in Attention DPLB policy against the complete vLLM config.
 # Expansion exception: upstream VllmConfig.__post_init__ is a large validation
 # pipeline; keep narrow original-function delegation so this patch only owns
 # the AFD backend validation bypass.
@@ -121,17 +125,21 @@ def __post_init__(self):
 
     assert _original_vllm_config_post_init is not None
     if not _should_relax_vllm_config_backend(self):
-        return _original_vllm_config_post_init(self)
-
-    # ### PATCH START: AFD repeated ubatching backend validation
-    parallel_config = self.parallel_config
-    original_backend = parallel_config.all2all_backend
-    parallel_config.all2all_backend = _AFD_TEMP_BACKEND
-    try:
         result = _original_vllm_config_post_init(self)
-    finally:
-        parallel_config.all2all_backend = original_backend
-    # ### PATCH END: AFD repeated ubatching backend validation
+    else:
+        # ### PATCH START: AFD repeated ubatching backend validation
+        parallel_config = self.parallel_config
+        original_backend = parallel_config.all2all_backend
+        parallel_config.all2all_backend = _AFD_TEMP_BACKEND
+        try:
+            result = _original_vllm_config_post_init(self)
+        finally:
+            parallel_config.all2all_backend = original_backend
+        # ### PATCH END: AFD repeated ubatching backend validation
+
+    # ### PATCH START: AFD Attention DPLB validation
+    validate_attention_dplb_config(self)
+    # ### PATCH END: AFD Attention DPLB validation
     return result
 
 

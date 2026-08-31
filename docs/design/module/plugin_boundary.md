@@ -133,6 +133,7 @@ must be placed under `connector_extra_config`.
 | `host`, `port` | `127.0.0.1`, `1239` | Connector rendezvous/control endpoint inputs. |
 | `num_attention_ranks`, `num_ffn_ranks` | `1`, `1` | AFD role-group sizes used by topology construction. |
 | `compute_gate_on_attention` | `false` | Moves supported gate/MoE routing work to Attention. CUDA supports both gate placements at the remote-experts boundary; synchronous CAMP2P still requires `false`, while CAM async requires `true`. |
+| `attention_dplb_policy` | `request_count` | Selects native request-count DPLB or the experimental async Attention `prefill_token_sum` policy. It is runtime routing state and is excluded from the graph hash. |
 | `connector_extra_config` | `{}` | Envelope key parsed by the selected connector into a typed `ConnectorExtraInfo`; it is not stored on `AFDConfig`. |
 
 The compatibility aliases `afd_connector`, `afd_role`, `afd_port`, `afd_host`,

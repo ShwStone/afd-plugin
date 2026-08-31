@@ -151,12 +151,36 @@ There is no separate `--afd-config` option.
 | `num_attention_ranks` | `int` | `1` | Total Attention ranks across all DP and TP groups. |
 | `num_ffn_ranks` | `int` | `1` | Total FFN expert ranks. |
 | `compute_gate_on_attention` | `bool` | `false` | Must be `true`; CAM async runs MoE routing on Attention before dispatching to FFN ranks. |
+| `attention_dplb_policy` | `"request_count" \| "prefill_token_sum"` | `"request_count"` | Attention-only internal DP routing policy. The token policy is experimental and requires the prefill-only constraints below. |
 | `connector_extra_config` | `dict` | `{}` | Connector-specific settings. Unknown top-level AFD fields are rejected. |
 
 Compatibility aliases `afd_role`, `afd_connector`, `afd_host`, and `afd_port`
 are also accepted. New configurations should use the canonical names shown
 above, except `async`, which is retained as the documented compatibility
 spelling used by the recipes.
+
+### Experimental prefill-token DPLB
+
+Set `"attention_dplb_policy": "prefill_token_sum"` on the Attention service to
+opt into token-aware internal DP routing. The default remains vLLM's native
+`waiting * 4 + running` request-count score.
+
+The simulated FIFO wave token-sum score reduces algebraically to each DP's live
+unfinished prompt-token debt, so the runtime publishes that scalar instead of
+rebuilding FIFO waves. Updates are asynchronous and do not introduce DP wave
+barriers, collectives, dummy batches, or `FIRST_REQ` wakeups. The frontend uses
+request count as a tie-breaker and applies optimistic token and waiting-count
+increments between coordinator snapshots.
+
+The first implementation requires internal DP load balancing with DP greater
+than one, FCFS, the default scheduler class, static EP, and no speculative
+decoding. Only text generation requests with token-ID prompts, `max_tokens=1`,
+`n=1`, and no multimodal, embedding, LoRA, structured-output, resumable,
+priority, or immediate-abort behavior use the token score. Missing, stale,
+mixed-workload, or oversized-backlog token state falls back to request-count
+DPLB for the whole routing decision. Live scheduler scans are limited to 4,096
+requests and run at most once per 100 ms. Hardware validation is required before
+changing the default.
 
 ### CAM async `connector_extra_config`
 

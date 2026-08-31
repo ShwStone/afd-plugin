@@ -9,6 +9,8 @@ This module patches:
 4. ``vllm.v1.engine.coordinator.DPCoordinatorProc.run_coordinator``
 5. ``vllm.v1.engine.coordinator.DPCoordinatorProc.process_input_socket``
 6. ``vllm.v1.engine.core_client.DPAsyncMPClient.add_request_async``
+7. ``vllm.v1.engine.core_client.DPLBAsyncMPClient.get_core_engine_for_request``
+8. ``vllm.v1.engine.core_client.DPLBAsyncMPClient.process_engine_outputs``
 
 Why:
     vLLM 0.26.0's native MoE DP path uses ``DPEngineCoreProc`` and DP wave
@@ -41,8 +43,13 @@ import vllm.v1.engine.core_client as core_client_module
 import vllm.v1.engine.utils as engine_utils_module
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import EngineCoreProc
-from vllm.v1.engine.core_client import DPAsyncMPClient
+from vllm.v1.engine.core_client import DPAsyncMPClient, DPLBAsyncMPClient
 
+from afd_plugin.compat.patches.async_dp_stats import (
+    AFD_DPLB_STATS_KEY,
+    AFD_DPLB_STATS_VERSION,
+    PREFILL_TOKEN_DEBT_STALE_AFTER_MS,
+)
 from afd_plugin.compat.vllm import TARGET_VLLM_VERSION
 from afd_plugin.config import is_afd_async_dp, parse_optional_afd_config
 
@@ -51,13 +58,18 @@ if TYPE_CHECKING:
 
     from vllm.config import VllmConfig
     from vllm.v1.engine import EngineCoreRequest
-    from vllm.v1.engine.coordinator import DPCoordinator
+    from vllm.v1.engine.coordinator import DPCoordinator, DPCoordinatorProc
     from vllm.v1.engine.utils import (
         CoreEngineActorManager,
         CoreEngineProcManager,
         EngineZmqAddresses,
     )
     from vllm.v1.executor import Executor
+
+
+_DPLB_STATS_VERSION_INDEX = 2
+_DPLB_PREFILL_TOKEN_DEBT_INDEX = 3
+_AFD_BLOCKED_REQUESTS_ATTR = "_afd_prefill_token_dplb_blocked_requests"
 
 
 # Patch reason: vLLM's MoE DP engine process uses DPEngineCoreProc, but AFD
@@ -378,10 +390,12 @@ def run_coordinator(
 
 
 # Patch reason: vLLM 0.26.0 groups request-count updates by globally synchronized
-# DP steps, but AFD async Attention engines advance independently.
-# Patch functionality: preserve upstream coordinator transport and its 100 ms
-# frontend publication cadence while skipping lockstep snapshot/warning behavior
-# whenever wave coordination is disabled.
+# DP steps and has no token-work statistic, but AFD async Attention engines
+# advance independently and may opt into prefill-token load balancing.
+# Patch functionality: preserve upstream coordinator transport and publication
+# cadence, skip lockstep snapshot behavior when wave coordination is disabled,
+# and forward a versioned, stale-safe scalar token debt without coordinating
+# engine execution.
 # Signature: matches upstream; no added parameters.
 def process_input_socket(
     self,
@@ -412,6 +426,15 @@ def process_input_socket(
     last_stats_step = -1
     last_stats_wave = -1
     last_step_counts: list[list[int]] | None = None
+
+    # ### PATCH START: AFD asynchronous prefill-token debt state
+    # The optional token-sum policy extends each frontend count row with a
+    # version and one scalar debt. This state is latest-value only and never
+    # coordinates engine execution.
+    prefill_token_debts: list[int | None] = [None for _ in self.engines]
+    prefill_token_debt_update_ms = [0 for _ in self.engines]
+    prefill_token_debt_seen = False
+    # ### PATCH END: AFD asynchronous prefill-token debt state
 
     with (
         make_zmq_socket(
@@ -463,10 +486,16 @@ def process_input_socket(
         poller.register(output_back, zmq.POLLIN)
         last_publish_time = 0
         while True:
-            elapsed = int(time.time() * 1000) - last_publish_time
-            # Send at stats_update_interval_ms interval if the stats have
-            # changed, or otherwise every 5 seconds.
-            wait_for = self.stats_update_interval_ms if stats_changed else 5000
+            # ### PATCH START: AFD monotonic stats/debt publication deadline
+            now_ms = int(time.monotonic() * 1000)
+            publish_deadline_ms = _get_stats_publish_deadline_ms(
+                last_publish_time,
+                self.stats_update_interval_ms,
+                stats_changed,
+                prefill_token_debt_update_ms if prefill_token_debt_seen else None,
+            )
+            wait_for = max(0, publish_deadline_ms - now_ms)
+            # ### PATCH END: AFD monotonic stats/debt publication deadline
 
             # ### PATCH START: AFD independent request-count cadence
             # Only lockstep DP engines have a shared step whose rank-local
@@ -476,10 +505,20 @@ def process_input_socket(
             )
             # ### PATCH END: AFD independent request-count cadence
 
-            events = poller.poll(timeout=max(min_timeout, wait_for - elapsed))
+            events = poller.poll(timeout=max(min_timeout, wait_for))
             if not events:
                 # Poller timeout - publish current stats to front-ends.
-                if last_step_counts is not None:
+                # ### PATCH START: AFD prefill-token debt publication
+                if prefill_token_debt_seen:
+                    engine_req_counts_list = _get_augmented_engine_counts(
+                        self,
+                        prefill_token_debts,
+                        prefill_token_debt_update_ms,
+                        int(time.monotonic() * 1000),
+                    )
+                    stats_changed = False
+                # ### PATCH END: AFD prefill-token debt publication
+                elif last_step_counts is not None:
                     engine_req_counts_list = last_step_counts
                     last_step_counts = None
                 else:
@@ -488,7 +527,14 @@ def process_input_socket(
 
                 to_publish = (engine_req_counts_list, current_wave, engines_running)
                 publish_front.send(msgspec.msgpack.encode(to_publish))
-                last_publish_time = int(time.time() * 1000)
+                # ### PATCH START: AFD monotonic debt expiry publication
+                last_publish_time = int(time.monotonic() * 1000)
+                if prefill_token_debt_seen:
+                    _clear_expired_prefill_token_debt_updates(
+                        prefill_token_debt_update_ms,
+                        last_publish_time,
+                    )
+                # ### PATCH END: AFD monotonic debt expiry publication
                 continue
 
             events = dict(events)
@@ -528,6 +574,10 @@ def process_input_socket(
                     if new_engine_count > current_count:
                         for _ in range(new_engine_count - current_count):
                             self.engines.append(EngineState())
+                            # ### PATCH START: AFD token-debt scale alignment
+                            prefill_token_debts.append(None)
+                            prefill_token_debt_update_ms.append(0)
+                            # ### PATCH END: AFD token-debt scale alignment
                         # NOTE(yongji): handle the case
                         # where newly started engines have current_wave = 0
                         # if existing engines just finished a wave
@@ -545,6 +595,12 @@ def process_input_socket(
                         )
                     else:
                         self.engines = self.engines[:new_engine_count]
+                        # ### PATCH START: AFD token-debt scale alignment
+                        prefill_token_debts = prefill_token_debts[:new_engine_count]
+                        prefill_token_debt_update_ms = prefill_token_debt_update_ms[
+                            :new_engine_count
+                        ]
+                        # ### PATCH END: AFD token-debt scale alignment
                         logger.info(
                             "DPCoordinator scaled down from %s to %s engines",
                             current_count,
@@ -618,6 +674,35 @@ def process_input_socket(
                     # ### PATCH END: AFD independent request-count updates
                     stats[0] = scheduler_stats.num_waiting_reqs
                     stats[1] = scheduler_stats.num_running_reqs
+                    # ### PATCH START: AFD asynchronous prefill-token debt
+                    connector_stats = scheduler_stats.kv_connector_stats
+                    if (
+                        isinstance(connector_stats, dict)
+                        and AFD_DPLB_STATS_KEY in connector_stats
+                    ):
+                        token_stats = connector_stats[AFD_DPLB_STATS_KEY]
+                        if (
+                            isinstance(token_stats, dict)
+                            and token_stats.get("version") == AFD_DPLB_STATS_VERSION
+                        ):
+                            token_debt = token_stats.get("prefill_token_debt")
+                            if not (
+                                token_debt is None
+                                or isinstance(token_debt, int)
+                                and not isinstance(token_debt, bool)
+                                and token_debt >= 0
+                            ):
+                                token_debt = None
+                            prefill_token_debts[eng_index] = token_debt
+                            prefill_token_debt_update_ms[eng_index] = int(
+                                time.monotonic() * 1000
+                            )
+                            if not prefill_token_debt_seen and last_publish_time == 0:
+                                last_publish_time = prefill_token_debt_update_ms[
+                                    eng_index
+                                ]
+                            prefill_token_debt_seen = True
+                    # ### PATCH END: AFD asynchronous prefill-token debt
                     stats_changed = True
 
                 # Wave coordination: handle wave completion and start notifications
@@ -658,6 +743,270 @@ def process_input_socket(
                 message = (None, current_wave, engines_running)
                 publish_front.send(msgspec.msgpack.encode(message))
 
+            # ### PATCH START: AFD non-starvable token-stats publication
+            # A continuously readable engine socket must not postpone either
+            # the 100 ms frontend update or the 500 ms debt expiry deadline.
+            if prefill_token_debt_seen:
+                now_ms = int(time.monotonic() * 1000)
+                publish_deadline_ms = _get_stats_publish_deadline_ms(
+                    last_publish_time,
+                    self.stats_update_interval_ms,
+                    stats_changed,
+                    prefill_token_debt_update_ms,
+                )
+                if now_ms >= publish_deadline_ms:
+                    engine_req_counts_list = _get_augmented_engine_counts(
+                        self,
+                        prefill_token_debts,
+                        prefill_token_debt_update_ms,
+                        now_ms,
+                    )
+                    to_publish = (
+                        engine_req_counts_list,
+                        current_wave,
+                        engines_running,
+                    )
+                    publish_front.send(msgspec.msgpack.encode(to_publish))
+                    last_publish_time = now_ms
+                    stats_changed = False
+                    _clear_expired_prefill_token_debt_updates(
+                        prefill_token_debt_update_ms,
+                        now_ms,
+                    )
+            # ### PATCH END: AFD non-starvable token-stats publication
+
+
+def _get_stats_publish_deadline_ms(
+    last_publish_time_ms: int,
+    stats_update_interval_ms: int,
+    stats_changed: bool,
+    prefill_token_debt_update_ms: list[int] | None,
+) -> int:
+    publish_interval_ms = stats_update_interval_ms if stats_changed else 5000
+    publish_deadline_ms = last_publish_time_ms + publish_interval_ms
+    if prefill_token_debt_update_ms is not None:
+        debt_expiry_deadlines = [
+            update_ms + PREFILL_TOKEN_DEBT_STALE_AFTER_MS
+            for update_ms in prefill_token_debt_update_ms
+            if update_ms > 0
+        ]
+        if debt_expiry_deadlines:
+            publish_deadline_ms = min(
+                publish_deadline_ms,
+                min(debt_expiry_deadlines),
+            )
+    return publish_deadline_ms
+
+
+def _clear_expired_prefill_token_debt_updates(
+    prefill_token_debt_update_ms: list[int],
+    now_ms: int,
+) -> None:
+    for engine_index, update_ms in enumerate(prefill_token_debt_update_ms):
+        if update_ms > 0 and now_ms - update_ms >= PREFILL_TOKEN_DEBT_STALE_AFTER_MS:
+            prefill_token_debt_update_ms[engine_index] = 0
+
+
+def _get_augmented_engine_counts(
+    coordinator: DPCoordinatorProc,
+    prefill_token_debts: list[int | None],
+    prefill_token_debt_update_ms: list[int],
+    now_ms: int,
+) -> list[list[int | None]]:
+    """Append versioned, stale-safe token debt to coordinator count rows."""
+
+    augmented_counts: list[list[int | None]] = []
+    for engine_index, counts in enumerate(coordinator._get_engine_counts()):
+        waiting, running = counts
+        token_debt = prefill_token_debts[engine_index]
+        update_ms = prefill_token_debt_update_ms[engine_index]
+        if update_ms == 0 or now_ms - update_ms >= PREFILL_TOKEN_DEBT_STALE_AFTER_MS:
+            token_debt = 0 if waiting == 0 and running == 0 else None
+        augmented_counts.append(
+            [
+                waiting,
+                running,
+                AFD_DPLB_STATS_VERSION,
+                token_debt,
+            ]
+        )
+    return augmented_counts
+
+
+# Patch reason: vLLM's native DPLB score only sees request counts, which treats
+# long and short prefill-only prompts as equal work.
+# Patch functionality: for the opt-in AFD policy, select the least live prefill
+# token debt while retaining count-score tie-breaking, rotating ties, optimistic
+# local increments, explicit-rank routing, and count-only fallback.
+# Signature: matches upstream; no added parameters.
+def get_core_engine_for_request(
+    self,
+    request: EngineCoreRequest,
+) -> core_client_module.EngineIdentity:
+    # Engines are in rank order.
+    if (eng_index := request.data_parallel_rank) is None and (
+        eng_index := core_client_module.get_late_interaction_engine_index(
+            request.pooling_params, len(self.core_engines)
+        )
+    ) is None:
+        # ### PATCH START: AFD prefill-token-sum routing
+        current_counts = self.lb_engines
+        token_policy_enabled = _prefill_token_dplb_enabled(self.vllm_config)
+        request_is_eligible = token_policy_enabled and (
+            _request_supports_prefill_token_dplb(request)
+        )
+        blocked_requests: set[str] | None = None
+        if token_policy_enabled:
+            blocked_requests = _get_blocked_prefill_token_dplb_requests(self)
+            if not request_is_eligible:
+                blocked_requests.add(request.request_id)
+                _invalidate_local_prefill_token_debts(current_counts)
+        use_token_score = bool(request_is_eligible and not blocked_requests)
+
+        if use_token_score:
+            for counts in current_counts:
+                if (
+                    len(counts) <= _DPLB_PREFILL_TOKEN_DEBT_INDEX
+                    or counts[_DPLB_STATS_VERSION_INDEX] != AFD_DPLB_STATS_VERSION
+                    or not isinstance(counts[_DPLB_PREFILL_TOKEN_DEBT_INDEX], int)
+                    or isinstance(counts[_DPLB_PREFILL_TOKEN_DEBT_INDEX], bool)
+                    or counts[_DPLB_PREFILL_TOKEN_DEBT_INDEX] < 0
+                ):
+                    use_token_score = False
+                    break
+
+        # TODO use P2C alg for larger DP sizes
+        num_engines = len(current_counts)
+        min_score = (core_client_module.sys.maxsize, core_client_module.sys.maxsize)
+        eng_index = 0
+        for i in range(num_engines):
+            # Start from client_index to help with balancing when engines
+            # are empty.
+            idx = (self.eng_start_index + i) % num_engines
+            waiting = current_counts[idx][0]
+            running = current_counts[idx][1]
+            count_score = waiting * 4 + running
+            if use_token_score:
+                token_debt = current_counts[idx][_DPLB_PREFILL_TOKEN_DEBT_INDEX]
+                score = (token_debt, count_score)
+            else:
+                score = (count_score, 0)
+            if score < min_score:
+                min_score = score
+                eng_index = idx
+
+        # Increment local load for better balancing between coordinator stats
+        # updates (which happen every 100ms).
+        current_counts[eng_index][0] += self.client_count
+        if use_token_score:
+            prompt_token_ids = request.prompt_token_ids
+            assert prompt_token_ids is not None
+            prompt_tokens = len(prompt_token_ids)
+            current_counts[eng_index][_DPLB_PREFILL_TOKEN_DEBT_INDEX] += (
+                prompt_tokens * self.client_count
+            )
+        # Rotate the scan start so equal scores do not systematically favor the
+        # same engine after a coordinator reset.
+        self.eng_start_index = (self.eng_start_index + 1) % num_engines
+        core_client_module.logger.debug(
+            "AFD Attention DPLB selected engine %d with policy=%s scores=%s",
+            eng_index,
+            "prefill_token_sum" if use_token_score else "request_count",
+            current_counts,
+        )
+    elif _prefill_token_dplb_enabled(self.vllm_config):
+        # Explicit or late-interaction routing bypasses the load score. Wait for
+        # the request to finish and for a new global snapshot rather than
+        # retaining a partial local debt.
+        blocked_requests = _get_blocked_prefill_token_dplb_requests(self)
+        blocked_requests.add(request.request_id)
+        _invalidate_local_prefill_token_debts(self.lb_engines)
+        # ### PATCH END: AFD prefill-token-sum routing
+
+    chosen_engine = self.core_engines[eng_index]
+    # Record which engine is chosen for this request, to handle aborts.
+    self.reqs_in_flight[request.request_id] = chosen_engine
+    return chosen_engine
+
+
+def _prefill_token_dplb_enabled(vllm_config: VllmConfig) -> bool:
+    afd_config = parse_optional_afd_config(vllm_config, validate=False)
+    return bool(
+        afd_config is not None
+        and afd_config.role == "attention"
+        and afd_config.attention_dplb_policy == "prefill_token_sum"
+    )
+
+
+def _request_supports_prefill_token_dplb(request: EngineCoreRequest) -> bool:
+    sampling_params = request.sampling_params
+    return bool(
+        sampling_params is not None
+        and request.pooling_params is None
+        and sampling_params.max_tokens == 1
+        and sampling_params.n == 1
+        and sampling_params.structured_outputs is None
+        and request.prompt_token_ids is not None
+        and request.prompt_embeds is None
+        and not request.mm_features
+        and request.lora_request is None
+        and request.priority == 0
+        and not request.resumable
+        and not request.abort_immediately
+    )
+
+
+def _invalidate_local_prefill_token_debts(
+    current_counts: list[list[int]],
+) -> None:
+    for counts in current_counts:
+        if len(counts) > _DPLB_PREFILL_TOKEN_DEBT_INDEX:
+            counts[_DPLB_PREFILL_TOKEN_DEBT_INDEX] = -1
+
+
+def _get_blocked_prefill_token_dplb_requests(
+    client: DPLBAsyncMPClient,
+) -> set[str]:
+    try:
+        return client.__dict__[_AFD_BLOCKED_REQUESTS_ATTR]
+    except KeyError:
+        blocked_requests: set[str] = set()
+        client.__dict__[_AFD_BLOCKED_REQUESTS_ATTR] = blocked_requests
+        return blocked_requests
+
+
+# Patch reason: vLLM completion cleanup only releases abort-routing state, while
+# AFD's token policy must also retain count fallback for locally observed mixed
+# traffic until every ineligible or explicitly routed request finishes.
+# Patch functionality: preserve native cleanup and clear plugin-owned fallback
+# state on completion, invalidating local debt until a fresh snapshot arrives.
+# Signature: matches upstream; no added parameters.
+@staticmethod
+async def process_engine_outputs(
+    self: DPLBAsyncMPClient,
+    outputs: engine_core_module.EngineCoreOutputs,
+):
+    if outputs.finished_requests and self.reqs_in_flight:
+        # ### PATCH START: AFD mixed-workload fallback lifecycle
+        token_policy_enabled = _prefill_token_dplb_enabled(self.vllm_config)
+        blocked_requests = (
+            _get_blocked_prefill_token_dplb_requests(self)
+            if token_policy_enabled
+            else None
+        )
+        had_blocked_requests = bool(blocked_requests)
+        # ### PATCH END: AFD mixed-workload fallback lifecycle
+        for req_id in outputs.finished_requests:
+            self.reqs_in_flight.pop(req_id, None)
+            # ### PATCH START: AFD mixed-workload fallback lifecycle
+            if blocked_requests is not None:
+                blocked_requests.discard(req_id)
+            # ### PATCH END: AFD mixed-workload fallback lifecycle
+        # ### PATCH START: AFD mixed-workload fallback lifecycle
+        if had_blocked_requests and not blocked_requests:
+            _invalidate_local_prefill_token_debts(self.lb_engines)
+        # ### PATCH END: AFD mixed-workload fallback lifecycle
+
 
 # Patch reason: vLLM sends FIRST_REQ wakeups to coordinate DP waves, which AFD
 # async-DP engines intentionally do not use.
@@ -680,14 +1029,23 @@ async def add_request_async(
     # ### PATCH START: AFD async-DP request wakeup
     # Async-DP engines step independently, so skip the coordinator FIRST_REQ
     # wakeup while preserving normal routing.
-    if not self.engines_running and not is_afd_async_dp(self.vllm_config):
-        req_msg = core_client_module.msgspec.msgpack.encode(
-            ("FIRST_REQ", chosen_engine),
-        )
-        await self.first_req_send_socket.send(req_msg)
-    # ### PATCH END: AFD async-DP request wakeup
+    try:
+        if not self.engines_running and not is_afd_async_dp(self.vllm_config):
+            req_msg = core_client_module.msgspec.msgpack.encode(
+                ("FIRST_REQ", chosen_engine),
+            )
+            await self.first_req_send_socket.send(req_msg)
+        # ### PATCH END: AFD async-DP request wakeup
 
-    await to_await
+        await to_await
+    except Exception:
+        # ### PATCH START: AFD token-fallback send rollback
+        if isinstance(self, DPLBAsyncMPClient) and _prefill_token_dplb_enabled(
+            self.vllm_config
+        ):
+            _get_blocked_prefill_token_dplb_requests(self).discard(request.request_id)
+        # ### PATCH END: AFD token-fallback send rollback
+        raise
 
     # The output queue task delivers completed responses and is independent of
     # the DP-wave FIRST_REQ coordination skipped above.
@@ -752,6 +1110,8 @@ def apply_async_dp_engine_patch() -> bool:
         )
         coordinator_module.DPCoordinatorProc.process_input_socket = process_input_socket
     DPAsyncMPClient.add_request_async = add_request_async
+    DPLBAsyncMPClient.get_core_engine_for_request = get_core_engine_for_request
+    DPLBAsyncMPClient.process_engine_outputs = process_engine_outputs
     engine_core_module.logger.debug("AFD async-DP engine patch applied")
     return True
 

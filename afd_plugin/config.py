@@ -18,8 +18,13 @@ if TYPE_CHECKING:
 AFD_ADDITIONAL_CONFIG_KEY: Final[str] = "afd"
 AFD_ASYNC_CONNECTOR: Final[str] = "CAMAsyncAFDConnector"
 AFDRole = Literal["attention", "ffn"]
+AttentionDPLBPolicy = Literal["request_count", "prefill_token_sum"]
 
 SUPPORTED_AFD_ROLES: Final[tuple[str, ...]] = ("attention", "ffn")
+SUPPORTED_ATTENTION_DPLB_POLICIES: Final[tuple[str, ...]] = (
+    "request_count",
+    "prefill_token_sum",
+)
 SUPPORTED_AFD_CONNECTORS: Final[tuple[str, ...]] = (
     "P2pNcclAFDConnector",
     "CAMP2pAFDConnector",
@@ -61,6 +66,8 @@ class AFDConfig:
     num_ffn_ranks: int = 1
     # Whether Attention computes MoE gate outputs before sending to FFN.
     compute_gate_on_attention: bool = False
+    # Frontend policy for internal async Attention DP load balancing.
+    attention_dplb_policy: AttentionDPLBPolicy = "request_count"
 
     @property
     def afd_connector(self) -> str:
@@ -311,6 +318,23 @@ def validate_afd_config(
         raise ValueError(
             "AFD async mode requires connector='CAMAsyncAFDConnector'",
         )
+    if config.attention_dplb_policy not in SUPPORTED_ATTENTION_DPLB_POLICIES:
+        raise ValueError(
+            "attention_dplb_policy must be one of "
+            f"{SUPPORTED_ATTENTION_DPLB_POLICIES!r}, got "
+            f"{config.attention_dplb_policy!r}",
+        )
+    if config.attention_dplb_policy == "prefill_token_sum":
+        if config.role != "attention":
+            raise ValueError(
+                "attention_dplb_policy='prefill_token_sum' is available only "
+                "for the Attention role",
+            )
+        if not config.async_dp or config.connector != AFD_ASYNC_CONNECTOR:
+            raise ValueError(
+                "attention_dplb_policy='prefill_token_sum' requires AFD async "
+                "mode with connector='CAMAsyncAFDConnector'",
+            )
     if config.connector == "P2pNcclAFDConnector":
         from afd_plugin.distributed import validate_p2p_topology
 
@@ -331,11 +355,13 @@ def validate_afd_config(
 __all__ = [
     "AFDConfig",
     "AFD_ASYNC_CONNECTOR",
+    "AttentionDPLBPolicy",
     "afd_config_from_mapping",
     "AFD_ADDITIONAL_CONFIG_KEY",
     "AFDRole",
     "SUPPORTED_AFD_CONNECTORS",
     "SUPPORTED_AFD_ROLES",
+    "SUPPORTED_ATTENTION_DPLB_POLICIES",
     "connector_extra_config_from_mapping",
     "connector_extra_config_from_source",
     "has_afd_config",

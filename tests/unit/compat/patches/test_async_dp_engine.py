@@ -255,8 +255,12 @@ def _install_fake_vllm_engine(monkeypatch: pytest.MonkeyPatch):
             await to_await
             self._ensure_output_queue_task()
 
+    class DPLBAsyncMPClient(DPAsyncMPClient):
+        pass
+
     client_module.msgspec = SimpleNamespace(msgpack=msgpack_codec)
     client_module.DPAsyncMPClient = DPAsyncMPClient
+    client_module.DPLBAsyncMPClient = DPLBAsyncMPClient
 
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
     monkeypatch.setitem(sys.modules, "vllm.v1", vllm_v1_module)
@@ -485,12 +489,14 @@ def test_dp_coordinator_separates_independent_and_lockstep_stats(
         current_wave=4,
         num_waiting_reqs=3,
         num_running_reqs=1,
+        kv_connector_stats=None,
     )
     stale_global_step_stats = SimpleNamespace(
         step_counter=1,
         current_wave=0,
         num_waiting_reqs=4,
         num_running_reqs=2,
+        kv_connector_stats=None,
     )
     output_front = Socket(stop_on_send=True)
     output_back = Socket(
@@ -543,7 +549,10 @@ def test_dp_coordinator_separates_independent_and_lockstep_stats(
     coordinator_module.make_zmq_socket = make_zmq_socket
     coordinator_module.MsgpackDecoder = Decoder
     coordinator_module.zmq.Poller = Poller
-    coordinator_module.time = SimpleNamespace(time=lambda: 1.0)
+    coordinator_module.time = SimpleNamespace(
+        time=lambda: 1.0,
+        monotonic=lambda: 1.0,
+    )
 
     coordinator = coordinator_module.DPCoordinatorProc(
         engine_count=2,
@@ -558,6 +567,151 @@ def test_dp_coordinator_separates_independent_and_lockstep_stats(
     assert output_front.sent == [([[3, 1], [4, 2]], 0, False)]
     assert poll_timeouts == expected_timeouts
     assert ("out-of-order step" in caplog.text) is expects_warning
+
+
+def test_dp_coordinator_forwards_asynchronous_prefill_token_debt(monkeypatch):
+    patch_module = _load_patch_module(monkeypatch)
+    coordinator_module = sys.modules["vllm.v1.engine.coordinator"]
+    core_module = sys.modules["vllm.v1.engine.core"]
+
+    class CoordinatorStoppedError(Exception):
+        pass
+
+    class Socket:
+        def __init__(self, received=(), *, stop_on_send=False):
+            self.received = deque(received)
+            self.sent = []
+            self.stop_on_send = stop_on_send
+
+        def recv(self):
+            return self.received.popleft()
+
+        def send(self, message):
+            self.sent.append(message)
+            if self.stop_on_send:
+                raise CoordinatorStoppedError
+
+    def token_stats(debt):
+        return SimpleNamespace(
+            step_counter=0,
+            current_wave=0,
+            num_waiting_reqs=1,
+            num_running_reqs=0,
+            kv_connector_stats={
+                patch_module.AFD_DPLB_STATS_KEY: {
+                    "version": patch_module.AFD_DPLB_STATS_VERSION,
+                    "prefill_token_debt": debt,
+                }
+            },
+        )
+
+    output_front = Socket(stop_on_send=True)
+    output_back = Socket(
+        (
+            core_module.EngineCoreOutputs(
+                scheduler_stats=token_stats(100),
+                engine_index=0,
+            ),
+            core_module.EngineCoreOutputs(
+                scheduler_stats=token_stats(20),
+                engine_index=1,
+            ),
+            core_module.EngineCoreOutputs(
+                scheduler_stats=token_stats(90),
+                engine_index=0,
+            ),
+        )
+    )
+    publish_back = Socket((b"\x01", b"\x01"))
+    sockets = {
+        "front": output_front,
+        "outputs": output_back,
+        "engines": publish_back,
+    }
+
+    @contextmanager
+    def make_zmq_socket(*, path, **_kwargs):
+        yield sockets[path]
+
+    event_batches = deque(
+        (
+            [(output_back, "POLLIN")],
+            [(output_back, "POLLIN")],
+            [(output_back, "POLLIN")],
+        )
+    )
+    clock = SimpleNamespace(monotonic_s=1.0)
+
+    class Poller:
+        def register(self, _socket, _event):
+            return None
+
+        def poll(self, timeout):
+            del timeout
+            clock.monotonic_s += 0.06
+            return event_batches.popleft()
+
+    class Decoder:
+        def __init__(self, _output_type):
+            pass
+
+        def decode(self, value):
+            return value
+
+    coordinator_module.make_zmq_socket = make_zmq_socket
+    coordinator_module.MsgpackDecoder = Decoder
+    coordinator_module.zmq.Poller = Poller
+    coordinator_module.time = SimpleNamespace(
+        # Publication must be independent of backward wall-clock movement.
+        time=lambda: -1000.0,
+        monotonic=lambda: clock.monotonic_s,
+    )
+
+    coordinator = coordinator_module.DPCoordinatorProc(
+        engine_count=2,
+        enable_wave_coordination=False,
+    )
+    with pytest.raises(CoordinatorStoppedError):
+        coordinator.process_input_socket("front", "outputs", "engines")
+
+    version = patch_module.AFD_DPLB_STATS_VERSION
+    assert output_front.sent == [([[1, 0, version, 90], [1, 0, version, 20]], 0, False)]
+
+
+def test_prefill_token_debt_snapshot_expires_busy_engines_only(monkeypatch):
+    patch_module = _load_patch_module(monkeypatch)
+    coordinator_module = sys.modules["vllm.v1.engine.coordinator"]
+    coordinator = coordinator_module.DPCoordinatorProc(
+        engine_count=2,
+        enable_wave_coordination=False,
+    )
+    coordinator.engines[0].request_counts = [2, 1]
+    coordinator.engines[1].request_counts = [0, 0]
+
+    fresh = patch_module._get_augmented_engine_counts(
+        coordinator,
+        [100, 50],
+        [900, 900],
+        1000,
+    )
+    boundary_fresh = patch_module._get_augmented_engine_counts(
+        coordinator,
+        [100, 50],
+        [900, 900],
+        1399,
+    )
+    stale = patch_module._get_augmented_engine_counts(
+        coordinator,
+        [100, 50],
+        [900, 900],
+        1400,
+    )
+
+    version = patch_module.AFD_DPLB_STATS_VERSION
+    expected_fresh = [[2, 1, version, 100], [0, 0, version, 50]]
+    assert fresh == expected_fresh
+    assert boundary_fresh == expected_fresh
+    assert stale == [[2, 1, version, None], [0, 0, version, 0]]
 
 
 def test_async_dp_client_skips_first_req(monkeypatch):
