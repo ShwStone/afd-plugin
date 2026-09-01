@@ -1,0 +1,40 @@
+# DSV4 Flash AFD 双机 32 卡 mbt 扫描（2026-09-01）
+
+## 配置
+
+- **拓扑**：双机 32 卡。Attention DP6TP4 = 24 ranks（node1 `v4f-base-2` 33.182.141.199 16 卡 = DP0-3，node2 `v4f-xnode-2` 33.182.140.47 卡 0-7 = DP4-5，headless，coordinator 在 node1）；FFN DP8EP8 = 8 ranks（node2 卡 8-15）。两 pod 同 /22 超节点（33.182.140.0/22）
+- **代码**：插件 `test/dsv4-afd-flash-dplb`（706958a，含 PR#289 v2 DPLB + #293 未配置故 inert + 本次新增 SP hash 路由修复）；vllm-ascend `e19e14da7`（CWS 分支）；vllm 568afb3 镜像原生
+- **参数**：CWS 全程开（`enable_dsv4_shared_compressor_workspace` + `multistream_dsv4_dsa_overlap:false`）、FLASHCOMM1=1（仅 attention；FFN TP1 强制 0）、HCCL_BUFFSIZE=2048（65536 格 4096）、util 0.80、max-model-len 70000、max-num-seqs 128、async-sched OFF、chunked prefill ON
+- **负载**：formal_1 原速（512 条、5,260,666 tok、150s 窗口、实测发送速率 35,070 tok/s 全格一致、send_deviation_ok=True）
+- 启动器 `tools/itask/launch_dsv4_afd_xnode32.sh`；cell 驱动 `tools/itask/xnode32_run_cell.sh`；清理脚本 pod 上 `/tmp/xnode32_cleanup.sh`
+
+## 结果（每格单次，全格 512/512 成功、零失败）
+
+| mbt | wall (s) | 排空 (s) | TTFT p50 | p95 | p99 | max | 有效吞吐 (tok/s) |
+|---|---|---|---|---|---|---|---|
+| 8192 | 209.2 | 58.6 | 29.84 | 54.35 | 59.44 | 66.29 | 25,143 |
+| 16384 | 158.2 | 8.2 | 3.19 | 10.63 | 14.68 | 20.83 | 33,256 |
+| 32768 | 158.2 | 7.8 | 2.46 | 6.66 | 10.45 | 12.04 | 33,257 |
+| 65536 | 158.2 | 7.5 | 2.22 | 5.72 | 7.29 | 8.35 | 33,258 |
+
+## 读数
+
+- **mbt=8192 是明显瓶颈格**：有效吞吐 25.1K < 供给 35K（1.39× 超载），TTFT 被排队主导（p50 29.8s、排空 58.6s）。chunk 太小导致 prefill 效率不足
+- **16384 起进入可服务区**（33.3K ≈ 供给的 95%，drain 8.2s），32768/65536 完全消化 35K 供给，差距在尾部延迟：p99 14.7 → 10.5 → 7.3s，max 20.8 → 12.0 → 8.4s
+- 单调收益、无回退：**该拓扑下 mbt 越大越好，65536 是最优格**（CWS 使 65536 的 KV 容量不再受限，见 v4-cws-compressor-workspace-mbt）
+- 对照单机 8+8 卡（DP2TP4+DP8EP8, mbt=10240）容量 17.8K tok/s：32 卡 mbt≥16384 后容量 ≥35K（供给受限），mbt=8192 格 25.1K 为 1.41×
+
+## 本次新踩的坑（已修）
+
+1. **SP hash 路由修复（代码改动）**：FLASHCOMM1=1 下 attention SP 把 token 按 TP4 切块（router_logits 32 = 128/4），但 `deepseek_v4_attention_gate.py` 直接拿 forward_context.input_ids（全量 128）做校验 → profile_run 崩 `input_ids/token count mismatch`。修复 = 对齐原生 experts_selector 的 flash_comm_v1 分支：pad 到 router_tokens×tp_size 后 `tensor_split` 取本 rank 连续块
+2. **FlashComm1 只能开 attention**：FFN TP1 直接断言 `Flash Comm v1 is only supported when tp_size > 1` → 启动器按角色分流
+3. **FFN recv buffer 随 attention rank 数膨胀**：24 attn ranks × mbt=65536 时 FFN `CamMoeDistributeDispatchRecv do tiling failed ret=-1`（buffer 不足签名）在 2048MB 仍炸，4096 通过（单机 8 ranks 时 1024 即够）
+4. **跨代残留**：FFN worker 进程名是 `VLLM::Worker_DP*`（不是 VLLMWorker 也不含 EngineCore 于旧 pkill 模式），且 npu-smi 进程表里 pid 在第 3 列不是第 2 列 —— 两代 FFN 残留各占 42GB 导致后续启动 "Free memory 19.68/61.28 GiB less than desired"
+5. **pkill 自匹配 2.0**：同一条 exec 命令里 awk 的正则文本（含 "EngineCore"）会被 pkill -f 匹配到自身 → 清理脚本必须落成 pod 上的文件再执行
+6. **驱动脚本**：itask exec CRLF 污染要让所有命令替换过 `tr -d '\r'` 再比较；远程 bash -c 双引号里 `$2` 会被远程侧提前展开（改用 `cat | grep -c`）
+7. CAM connector 端口 1239 会被上一代栈残留占用（EADDRINUSE）→ 清理含 /proc/net/tcp 04E7 端口等待
+
+## 归档
+
+- 本地：`bench_results/dsv4_afd_flash_xnode32/xnode32_mbt*.json`（4 格，含逐请求 TTFT）
+- NAS：`shwstone/xnode32_results/`（4 格 JSON + attn1/attn2/ffn 日志）

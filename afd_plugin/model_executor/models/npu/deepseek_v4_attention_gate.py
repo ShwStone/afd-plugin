@@ -61,6 +61,41 @@ def _compute_sqrtsoftplus_topk(
                 "context",
             )
         input_ids = input_ids.reshape(-1).to(torch.int64)
+        # FlashComm1 (SP): router_logits only hold this TP rank's contiguous
+        # chunk of the padded token sequence, while forward_context.input_ids
+        # is still the full padded sequence.  Mirror the native vllm-ascend
+        # selector (experts_selector flash_comm_v1 branch): pad to
+        # router_tokens * tp_size, then take this rank's contiguous chunk.
+        # AFD Attention has no moe_comm_method, so do it inline here.
+        tp_size = 1
+        tp_rank = 0
+        flash_comm_v1 = bool(getattr(forward_context, "flash_comm_v1_enabled", False))
+        if not flash_comm_v1:
+            try:
+                from vllm_ascend.ascend_config import get_ascend_config
+
+                flash_comm_v1 = bool(get_ascend_config().enable_flashcomm1)
+            except Exception:
+                flash_comm_v1 = False
+        if flash_comm_v1:
+            from vllm.distributed import get_tp_group
+
+            tp_group = get_tp_group()
+            tp_size = tp_group.world_size
+            tp_rank = tp_group.rank_in_group
+        if tp_size > 1:
+            target = router_logits.shape[0] * tp_size
+            if input_ids.numel() > target:
+                raise RuntimeError(
+                    "DSV4 Hash routing input_ids longer than the padded token "
+                    f"sequence on Attention: input_ids={input_ids.numel()} "
+                    f"padded_tokens={target}",
+                )
+            if input_ids.numel() < target:
+                input_ids = torch.nn.functional.pad(
+                    input_ids, (0, target - input_ids.numel())
+                )
+            input_ids = torch.tensor_split(input_ids, tp_size, dim=0)[tp_rank].contiguous()
         if input_ids.numel() != router_logits.shape[0]:
             raise RuntimeError(
                 "DSV4 Hash routing input_ids/token count mismatch on Attention: "
