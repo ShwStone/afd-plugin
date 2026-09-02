@@ -34,7 +34,20 @@
 6. **驱动脚本**：itask exec CRLF 污染要让所有命令替换过 `tr -d '\r'` 再比较；远程 bash -c 双引号里 `$2` 会被远程侧提前展开（改用 `cat | grep -c`）
 7. CAM connector 端口 1239 会被上一代栈残留占用（EADDRINUSE）→ 清理含 /proc/net/tcp 04E7 端口等待
 
+## 快放容量扫描（2026-09-02，固定 mbt=65536 + HCCL_BUFFSIZE=4096，同一 server 连跑）
+
+| 负载 | 供给 tok/s | wall (s) | 排空 (s) | TTFT p50 | p95 | p99 | max | 判定 |
+|---|---|---|---|---|---|---|---|---|
+| 1.0x | 35,070 | 158.2 | 7.5 | 2.22 | 5.72 | 7.29 | 8.35 | 轻松 |
+| 1.5x | 52,606 | 111.1 | 11.1 | 4.45 | 9.03 | 11.37 | 14.06 | 跟上 |
+| 2.0x | 70,142 | 87.1 | 12.0 | 5.44 | 12.07 | 13.91 | 15.06 | 跟上 |
+
+- 全档 512/512 零失败；两档快放排空仅 11-12s → **容量下界 ≥70K tok/s，knee 未触达**（2x 里瞬时 93K 突发桶只产生短暂排队：30-45s 桶供给 93.2K/完成 62.7K，随后两桶 75-77K 追平）
+- TTFT 随负载平缓退化（p50 2.2→4.5→5.4s，p99 7.3→11.4→13.9s），无崩溃拐点
+- 注：pod 重启后 vllm-ascend 需恢复（master 因 GitHub 不通改用 NAS format-patch 2 个 commit 落到 80d8c194f 上，HEAD=ce2c8d96d 内容等同 e19e14da7；xnode-2 直接 fetch 成功）；新增坑：node2 上 attention-headless 与 FFN 同时启动会在 stateless_init_dp_group 的 get_open_port 竞态 EADDRINUSE → FFN DP 组起不来整栈挂死，对策=FFN 错后 20s 启动
+
 ## 归档
 
-- 本地：`bench_results/dsv4_afd_flash_xnode32/xnode32_mbt*.json`（4 格，含逐请求 TTFT）
-- NAS：`shwstone/xnode32_results/`（4 格 JSON + attn1/attn2/ffn 日志）
+- 本地：`bench_results/dsv4_afd_flash_xnode32/xnode32_mbt*.json`（4 格 mbt 扫描 + fast1p5x/fast2x，含逐请求 TTFT）、`formal_1_arrivals.png`（数据集到达形态图）
+- NAS：`shwstone/xnode32_results/`（全部 JSON + 三侧日志 + README）
+- 快放 plan：`tools/datasets/moonconv-wildchat-v4-flash-prefill/workloads/formal_1_fast{1p5x,2x}_plan.json`（52.6K/70.1K tok/s，窗口 100s/75s）；驱动 `tools/itask/xnode32_speed_runs.sh`
