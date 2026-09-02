@@ -618,6 +618,38 @@ def _prepare_late_loaded_ffn_engine_core(
             scheduler_config.get_scheduler_cls = lambda: _AFDFFNNoopScheduler
 
 
+def _drain_ffn_client_requests(self, core_module: Any) -> None:
+    """Serve scheduler-free client RPCs from the input queue.
+
+    The FFN connector loop never runs the normal request path, but the API
+    server still routes utility calls through the input queue: startup calls
+    ``get_supported_tasks`` before binding the HTTP listener, and
+    request-controlled profiling sends ``profile`` on ``/start_profile`` and
+    ``/stop_profile``. Drain those here so the FFN API server can finish
+    startup and the profiling endpoints answer. Request types that need a
+    scheduler are logged and dropped.
+    """
+    input_queue = getattr(self, "input_queue", None)
+    handle = getattr(self, "_handle_client_request", None)
+    if input_queue is None or handle is None:
+        return
+    utility_type = getattr(core_module.EngineCoreRequestType, "UTILITY", None)
+    wakeup_type = getattr(core_module.EngineCoreRequestType, "WAKEUP", None)
+    while True:
+        try:
+            request_type, request = input_queue.get_nowait()
+        except queue.Empty:
+            return
+        if request_type in (utility_type, wakeup_type):
+            handle(request_type, request)
+        else:
+            core_module.logger.warning(
+                "AFD FFN EngineCore dropping client request %s: "
+                "the connector daemon has no scheduler",
+                request_type,
+            )
+
+
 def _run_ffn_busy_loop(self, core_module: Any) -> None:
     started = False
     try:
@@ -629,6 +661,7 @@ def _run_ffn_busy_loop(self, core_module: Any) -> None:
             "AFD FFN EngineCore started; workers run connector loop."
         )
         while _is_running(self, core_module):
+            _drain_ffn_client_requests(self, core_module)
             self.model_executor.collective_rpc("raise_ffn_loop_error_if_any")
             time.sleep(0.5)
     except KeyboardInterrupt:
