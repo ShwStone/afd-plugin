@@ -1567,13 +1567,9 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
         *,
         stage_idx,
         max_num_tokens,
-        transaction_id,
-        layer_idx,
     ):
         assert stage_idx == 0
         assert max_num_tokens == 16
-        assert transaction_id == "afd-npu-9"
-        assert layer_idx == 0
         return work_item
 
     def send_ffn_work_item_output(sent_work_item, ffn_output):
@@ -1607,27 +1603,21 @@ def test_npu_ffn_connector_driven_uses_cam_layer_and_token_metadata(monkeypatch)
 
 def test_npu_ffn_trace_identity_keeps_two_stages_in_one_transaction():
     _require_npu_runtime()
-    from afd_plugin.v1.worker.npu.ffn_model_runner import AFDNPUFFNModelRunner
+    from afd_plugin.connectors.npu.async_cam import _AFDFFNStreamTracker
 
-    runner = object.__new__(AFDNPUFFNModelRunner)
-    runner._afd_connector_work_item_counter = 0
-    layer_indices = [3, 5]
+    tracker = _AFDFFNStreamTracker(attn_ranks_per_dp=4)
 
-    identities = [
-        runner._next_afd_trace_transfer_identity(
-            layer_indices,
-            num_stages=2,
-        )
-        for _ in range(5)
-    ]
-
-    assert identities == [
-        ("afd-npu-0", 3, 0),
-        ("afd-npu-0", 3, 1),
-        ("afd-npu-0", 5, 0),
-        ("afd-npu-0", 5, 1),
-        ("afd-npu-1", 3, 0),
-    ]
+    # Two-stage forward from engine 0 (source ranks 0-3): stage-fastest
+    # per-layer order, then a one-stage forward from engine 1 (ranks 4-7).
+    assert tracker.observe(1, 3) == (0, 0, 0)
+    assert tracker.observe(2, 3) == (0, 0, 1)
+    assert tracker.observe(0, 5) == (0, 0, 0)
+    assert tracker.observe(3, 5) == (0, 0, 1)
+    assert tracker.observe(4, 3) == (1, 0, 0)
+    assert tracker.observe(5, 5) == (1, 0, 0)
+    # A layer decrease starts the next transaction for that engine only.
+    assert tracker.observe(1, 3) == (0, 1, 0)
+    assert tracker.observe(6, 7) == (1, 0, 0)
 
 
 def test_npu_ffn_profiler_steps_once_per_two_stage_transaction(monkeypatch):

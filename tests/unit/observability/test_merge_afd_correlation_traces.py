@@ -66,6 +66,100 @@ def _range_events(
     ]
 
 
+def test_merge_tolerates_partial_rank_participation(tmp_path: Path) -> None:
+    """Flows routed to a subset of ranks are complete when every participant
+    has paired phases — DP/EP topologies legitimately skip ranks."""
+
+    def multi_pid_sidecar(path: str, role: str, pid: int) -> Sidecar:
+        return Sidecar(
+            path=Path(path),
+            metadata={
+                "session_id": "test-session",
+                "dropped_events": 0,
+                "identity": {
+                    "role": role,
+                    "role_rank": pid,
+                    "hostname": "host",
+                    "pid": pid,
+                },
+            },
+            anchors=[{"monotonic_ns": 1_000, "realtime_ns": 1_000_000}],
+            events=[],
+        )
+
+    # Two attention ranks, two FFN ranks; only rank 0 of each role sees flow.
+    attn0 = multi_pid_sidecar("attn0.jsonl", "attention", 11)
+    attn0.events = (
+        _range_events("afd.cam.dispatch_send", 1_100)
+        + _range_events("afd.cam.combine_recv", 1_500)
+    )
+    attn0.metadata["identity"]["pid"] = 11
+    attn1 = multi_pid_sidecar("attn1.jsonl", "attention", 12)
+    ffn0 = multi_pid_sidecar("ffn0.jsonl", "ffn", 13)
+    ffn0.events = (
+        _range_events("afd.cam.dispatch_recv", 1_200)
+        + _range_events("afd.ffn.compute", 1_300)
+        + _range_events("afd.cam.combine_send", 1_400)
+    )
+    ffn1 = multi_pid_sidecar("ffn1.jsonl", "ffn", 14)
+
+    sidecars = [attn0, attn1, ffn0, ffn1]
+    assign_clock_transforms(sidecars, [])
+    _trace, report = build_merged_trace(sidecars, [])
+    assert report["flows"]["total"] == 1
+    assert report["flows"]["complete"] == 1
+    assert report["flows"]["incomplete"] == []
+
+
+def test_merge_flags_unpaired_phase_on_participant(tmp_path: Path) -> None:
+    """A participant with a begin but no end still marks the flow incomplete."""
+    attention = _sidecar(
+        path="attention.jsonl",
+        role="attention",
+        hostname="host",
+        anchor_mono_ns=1_000,
+        anchor_realtime_ns=1_000_000,
+        events=(
+            _range_events("afd.cam.dispatch_send", 1_100)
+            + [
+                {  # combine_recv begin without end
+                    "event": "afd.cam.combine_recv",
+                    "flow_id": "abcdef0123456789",
+                    "transaction_id": "afd-npu-1",
+                    "layer_idx": 2,
+                    "stage_idx": 0,
+                    "num_tokens": 64,
+                    "phase": "begin",
+                    "monotonic_ns": 1_500,
+                },
+            ]
+        ),
+    )
+    ffn = _sidecar(
+        path="ffn.jsonl",
+        role="ffn",
+        hostname="host",
+        anchor_mono_ns=1_000,
+        anchor_realtime_ns=1_000_000,
+        events=(
+            _range_events("afd.cam.dispatch_recv", 1_200)
+            + _range_events("afd.ffn.compute", 1_300)
+            + _range_events("afd.cam.combine_send", 1_400)
+        ),
+    )
+    sidecars = [attention, ffn]
+    assign_clock_transforms(sidecars, [])
+    _trace, report = build_merged_trace(sidecars, [])
+    assert report["flows"]["total"] == 1
+    assert report["flows"]["complete"] == 0
+    incomplete = report["flows"]["incomplete"]
+    assert len(incomplete) == 1
+    assert incomplete[0]["missing_participants"][0]["event"] == (
+        "afd.cam.combine_recv"
+    )
+    assert incomplete[0]["missing_participants"][0]["missing_phases"] == ["end"]
+
+
 def test_best_clock_sample_selects_minimum_round_trip() -> None:
     offset_ns, uncertainty_ns = best_clock_sample(
         {

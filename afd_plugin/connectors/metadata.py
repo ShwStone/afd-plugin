@@ -310,6 +310,17 @@ class AFDForwardContextMetadata:
     transaction_id: str | None = None
     tokens_unpadded_lens: list[int] = field(default_factory=list)
 
+    def ensure_transaction_id(self) -> str | None:
+        """Claim a trace transaction ID lazily on first use.
+
+        Dispatch paths call this when building per-transfer metadata so the
+        ID is assigned only when a forward actually dispatches (keeping the
+        sequence gap-free) and shared by every layer/stage of the forward.
+        """
+        if self.transaction_id is None:
+            self.transaction_id = self.connector.claim_trace_transaction_id()
+        return self.transaction_id
+
     def clone(self) -> AFDForwardContextMetadata:
         cloned = copy.copy(self)
         cloned.tokens_start_loc = list(self.tokens_start_loc)

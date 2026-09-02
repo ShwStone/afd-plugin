@@ -630,7 +630,9 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
         batch_size,
         ubatch_idx,
         transaction_id,
+        trace,
     ):
+        assert trace is False
         assert ubatch_idx == 0
         assert transaction_id == "afd-npu-4"
         metadata = AFDTransferMetadata.create_ffn_metadata(
@@ -678,7 +680,7 @@ def test_async_ffn_work_item_uses_cam_layer_and_token_metadata(monkeypatch):
     assert work_item.hidden_states == "hidden[:5]"
     assert work_item.context.metadata.layer_idx == 11
     assert work_item.context.metadata.seq_lens == [5]
-    assert work_item.context.metadata.transaction_id == "afd-npu-4"
+    assert work_item.context.metadata.transaction_id == "afd-npu-e0-0"
     assert states.dynamic_scales == "scales[:5]"
     assert states.expand_x_shared == "shared-hidden[:2]"
     assert states.dynamic_scales_shared == "shared-scales[:2]"
@@ -709,7 +711,9 @@ def test_async_ffn_work_item_uses_expert_counts_for_routed_tokens(monkeypatch):
         batch_size,
         ubatch_idx,
         transaction_id,
+        trace,
     ):
+        assert trace is False
         assert ubatch_idx == 0
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
@@ -782,7 +786,9 @@ def test_async_send_ffn_work_item_output_preserves_all_shared_passthrough(
         batch_size,
         ubatch_idx,
         transaction_id,
+        trace,
     ):
+        assert trace is False
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=stage_idx,

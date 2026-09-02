@@ -329,17 +329,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         connector = cast(CAMAsyncAFDConnector, self.connector)
 
         for _ in layer_indices:
-            transaction_id, expected_layer_idx, stage_idx = (
-                self._next_afd_trace_transfer_identity(
-                    layer_indices,
-                    num_stages=num_stages,
-                )
-            )
             work_item = connector.recv_ffn_work_item(
-                stage_idx=stage_idx,
+                stage_idx=0,
                 max_num_tokens=self.max_num_tokens,
-                transaction_id=transaction_id,
-                layer_idx=expected_layer_idx,
             )
             hidden_states = work_item.hidden_states
             metadata = work_item.context.metadata
@@ -349,6 +341,9 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     "CAM async FFN work item requires AFDAsyncTransferState",
                 )
             layer_idx = work_item.layer_idx
+            # Trace identity comes from the received CAM payload (reconstructed
+            # by the connector's stream tracker), not a local prediction.
+            stage_idx = work_item.stage_idx
             num_tokens = work_item.num_tokens
             afd_metadata = AFDForwardContextMetadata(
                 tokens_start_loc=[0],
@@ -396,25 +391,6 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     rank_ffn_output,
                 )
         return rank_ffn_output
-
-    def _next_afd_trace_transfer_identity(
-        self,
-        layer_indices: list[int],
-        *,
-        num_stages: int,
-    ) -> tuple[str, int, int]:
-        work_items_per_transaction = len(layer_indices) * num_stages
-        transaction_ordinal, position = divmod(
-            self._afd_connector_work_item_counter,
-            work_items_per_transaction,
-        )
-        layer_offset, stage_idx = divmod(position, num_stages)
-        self._afd_connector_work_item_counter += 1
-        return (
-            f"afd-npu-{transaction_ordinal}",
-            layer_indices[layer_offset],
-            stage_idx,
-        )
 
     def capture_model(
         self,

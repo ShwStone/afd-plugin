@@ -62,6 +62,7 @@ from afd_plugin.distributed import (
     init_afd_process_group,
 )
 from afd_plugin.observability import create_afd_correlation_trace_recorder
+from afd_plugin.observability.correlation import monotonic_raw_ns
 
 if TYPE_CHECKING:
     from torch.distributed.distributed_c10d import ProcessGroup
@@ -226,6 +227,43 @@ class AFDAsyncTopology:
         return self.attn_size + self.ffn_size
 
 
+class _AFDFFNStreamTracker:
+    """Reconstruct per-engine transaction ordinals from the received stream.
+
+    The CAM payload carries only (token count, source rank, layer index), so
+    the FFN side rebuilds the Attention-side transaction identity from the
+    arrival stream: a new transaction starts when the layer index decreases
+    within one source engine's stream (Attention forwards emit MoE layers in
+    ascending order), and the stage is the zero-based occurrence count of that
+    layer within the current transaction (senders emit a layer's stages
+    consecutively). This stays synchronized with variable stage counts
+    (ubatch vs. non-ubatch forwards) and multiple Attention engines, where a
+    fixed ``divmod(position, layers * stages)`` mapping silently desyncs.
+    """
+
+    def __init__(self, attn_ranks_per_dp: int) -> None:
+        self._ranks_per_dp = max(1, int(attn_ranks_per_dp))
+        # engine -> [tx_ordinal, previous layer, layer occurrence counts]
+        self._streams: dict[int, list[Any]] = {}
+
+    def observe(self, source_rank: int, layer_idx: int) -> tuple[int, int, int]:
+        """Return (engine, transaction ordinal, stage) for one received item."""
+        engine = int(source_rank) // self._ranks_per_dp
+        stream = self._streams.get(engine)
+        if stream is None:
+            stream = [-1, None, {}]
+            self._streams[engine] = stream
+        layer_idx = int(layer_idx)
+        prev_layer = stream[1]
+        if prev_layer is None or layer_idx < prev_layer:
+            stream[0] += 1
+            stream[2] = {}
+        stage = stream[2].get(layer_idx, 0)
+        stream[2][layer_idx] = stage + 1
+        stream[1] = layer_idx
+        return engine, stream[0], stage
+
+
 class CAMAsyncAFDConnector(AFDConnectorBase):
     """CAM-backed asynchronous connector for Ascend NPU AFD.
 
@@ -289,12 +327,28 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             int,
             list[tuple[AFDTransferContext, Tensor, Tensor]],
         ] = {}
+        self._ffn_stream_tracker = _AFDFFNStreamTracker(
+            attn_ranks_per_dp=extra_info.attn_ranks_per_dp,
+        )
         self.trace_recorder = create_afd_correlation_trace_recorder(
             role=afd_config.role,
             rank=rank,
             role_rank=role_rank,
             local_rank=local_rank,
         )
+
+    def claim_trace_transaction_id(self) -> str:
+        """Assign an engine-scoped trace transaction ID on Attention ranks.
+
+        Attention DP engines count forwards independently, so the bare
+        ordinal collides across engines. Scoping by the CAM engine index
+        (``world_rank // attn_ranks_per_dp``) lets the FFN side reconstruct
+        the same ID from the source rank carried in the CAM receive header.
+        """
+        engine = self.world_rank // max(1, self.tp_size)
+        counter = self._trace_tx_counter
+        self._trace_tx_counter = counter + 1
+        return f"afd-npu-e{engine}-{counter}"
 
     @property
     def is_initialized(self) -> bool:
@@ -360,20 +414,30 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         *,
         stage_idx: int,
         max_num_tokens: int,
-        transaction_id: str,
-        layer_idx: int,
+        transaction_id: str | None = None,
+        layer_idx: int = 0,
     ) -> AFDAsyncFFNWorkItem:
         """Receive and normalize one connector-driven FFN dispatch item.
 
         CAM metadata supplies the actual layer and routed/shared token counts;
         returned tensors are sliced from operator capacity to those counts.
+
+        Trace identity comes from the received payload, not from the caller's
+        prediction: the CAM header carries the source Attention rank and layer
+        index, and ``_ffn_stream_tracker`` rebuilds the transaction ordinal
+        and stage from each engine's arrival stream. The dispatch-recv sidecar
+        events are emitted after the receive (with the pre-receive timestamp
+        preserved) so they carry the true identity; a zero-duration profiler
+        marker keeps the FIFO pairing with the device operation.
         """
+        recv_begin_ns = monotonic_raw_ns()
         recv_output = self.recv_attn_output(
             stage_idx=stage_idx,
             layer_idx=layer_idx,
             batch_size=max(1, self.max_seq_len or max_num_tokens),
             ubatch_idx=stage_idx,
             transaction_id=transaction_id,
+            trace=False,
         )
         context = recv_output.context
         metadata = context.metadata
@@ -389,7 +453,14 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         # received no routed tokens in this dispatch.  Such ranks must still
         # enter combine-send (the zero-token fallback below supplies its
         # placeholder) so every participant completes the CAM collective.
+        source_rank = int(token_nums_rankid_layeridx[1].item())
         received_layer_idx = int(token_nums_rankid_layeridx[2].item())
+
+        engine, tx_ordinal, true_stage_idx = self._ffn_stream_tracker.observe(
+            source_rank,
+            received_layer_idx,
+        )
+        true_transaction_id = f"afd-npu-e{engine}-{tx_ordinal}"
 
         expert_token_nums_shared = states.expert_token_nums_shared
         if expert_token_nums_shared is None:
@@ -410,9 +481,40 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             int(expert_token_nums.to(torch.int64).sum().item()),
         )
 
+        metadata.transaction_id = true_transaction_id
         metadata.layer_idx = received_layer_idx
-        metadata.stage_idx = stage_idx
+        metadata.stage_idx = true_stage_idx
         metadata.seq_lens = [num_tokens]
+
+        recv_flow_id = self.trace_recorder.make_flow_id(
+            true_transaction_id,
+            layer_idx=received_layer_idx,
+            stage_idx=true_stage_idx,
+        )
+        self.trace_recorder.record(
+            CAM_DISPATCH_RECV_TRACE_EVENT,
+            phase="begin",
+            flow_id=recv_flow_id,
+            transaction_id=true_transaction_id,
+            layer_idx=received_layer_idx,
+            stage_idx=true_stage_idx,
+            num_tokens=total_num_tokens,
+            monotonic_ns=recv_begin_ns,
+        )
+        self.trace_recorder.record(
+            CAM_DISPATCH_RECV_TRACE_EVENT,
+            phase="end",
+            flow_id=recv_flow_id,
+            transaction_id=true_transaction_id,
+            layer_idx=received_layer_idx,
+            stage_idx=true_stage_idx,
+            num_tokens=total_num_tokens,
+            outcome="ok",
+        )
+        self.trace_recorder.emit_profiler_marker(
+            CAM_DISPATCH_RECV_TRACE_EVENT,
+            recv_flow_id,
+        )
 
         hidden_states = recv_output.hidden_states[:num_tokens]
         if states.expand_x_shared is not None:
@@ -429,7 +531,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             context=context,
             recv_output=recv_output,
             layer_idx=received_layer_idx,
-            stage_idx=stage_idx,
+            stage_idx=true_stage_idx,
             num_tokens=num_tokens,
             total_num_tokens=total_num_tokens,
             shared_num_tokens=shared_num_tokens,
@@ -729,6 +831,7 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         batch_size = int(kwargs.get("batch_size", self.max_seq_len) or 1)
         layer_idx = int(kwargs.get("layer_idx", 0) or 0)
         transaction_id = kwargs.get("transaction_id")
+        trace = bool(kwargs.get("trace", True))
         metadata = AFDTransferMetadata.create_ffn_metadata(
             layer_idx=layer_idx,
             stage_idx=ubatch_idx,
@@ -764,19 +867,39 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
             dynamic_quant=self.dynamic_quant,
             group_name=self.group_name,
         )
-        flow_id = self.trace_recorder.make_flow_id(
-            metadata.transaction_id,
-            layer_idx=metadata.layer_idx,
-            stage_idx=metadata.stage_idx,
-        )
-        with self.trace_recorder.record_range(
-            CAM_DISPATCH_RECV_TRACE_EVENT,
-            flow_id=flow_id,
-            transaction_id=metadata.transaction_id,
-            layer_idx=metadata.layer_idx,
-            stage_idx=metadata.stage_idx,
-            num_tokens=metadata.total_tokens,
-        ):
+        if trace:
+            flow_id = self.trace_recorder.make_flow_id(
+                metadata.transaction_id,
+                layer_idx=metadata.layer_idx,
+                stage_idx=metadata.stage_idx,
+            )
+            with self.trace_recorder.record_range(
+                CAM_DISPATCH_RECV_TRACE_EVENT,
+                flow_id=flow_id,
+                transaction_id=metadata.transaction_id,
+                layer_idx=metadata.layer_idx,
+                stage_idx=metadata.stage_idx,
+                num_tokens=metadata.total_tokens,
+            ):
+                outputs = torch.ops.umdk_cam_op_lib.async_dispatch_recv(
+                    placeholder,
+                    self.comm_args,
+                    self.comm_id,
+                    states.batch_size,
+                    states.hidden_size,
+                    states.topk,
+                    self.ffn_size,
+                    self.attn_size,
+                    self.expert_per_rank,
+                    self.world_rank,
+                    self.topology.world_size,
+                    self.tp_size,
+                    self.dynamic_quant,
+                    self.group_name,
+                )
+        else:
+            # Deferred tracing: the caller re-tags with the payload's true
+            # source rank/layer after the receive completes.
             outputs = torch.ops.umdk_cam_op_lib.async_dispatch_recv(
                 placeholder,
                 self.comm_args,

@@ -157,7 +157,6 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_is_graph_capturing = False
         self._afd_pending_metadata: AFDForwardContextMetadata | None = None
         self._afd_suppress_metadata_send = False
-        self._afd_transaction_counter = 0
         self._afd_async_moe_ubatch_metadata = None
         self._afd_live_execution = False
         self.ubatch_slices = None
@@ -1417,7 +1416,10 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             connector=self.connector,
             tokens_lens=tokens_lens,
             num_stages=num_stages,
-            transaction_id=self._next_afd_transaction_id(),
+            # Claimed lazily at the first dispatch of this forward (see
+            # AFDForwardContextMetadata.ensure_transaction_id) so forwards
+            # that never dispatch leave no gaps in the transaction stream.
+            transaction_id=None,
             tokens_unpadded_lens=tokens_unpadded_lens,
         )
 
@@ -1922,11 +1924,6 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         stop_afd_npu_profiler(self.prof)
         self.connector.close()
         super().shutdown()
-
-    def _next_afd_transaction_id(self) -> str:
-        counter = self._afd_transaction_counter
-        self._afd_transaction_counter = counter + 1
-        return f"afd-npu-{counter}"
 
 
 def _make_uniform_dp_metadata(dp_size: int, num_tokens: int) -> AFDDPMetadata:

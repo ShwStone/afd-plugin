@@ -105,6 +105,20 @@ class AFDConnectorBase(ABC):
         self.extra_info = self.parse_extra_config(
             connector_extra_config_from_source(vllm_config),
         )
+        self._trace_tx_counter = 0
+
+    def claim_trace_transaction_id(self) -> str:
+        """Assign the next trace transaction ID for correlation sidecars.
+
+        IDs are claimed lazily at the first dispatch of a forward pass so
+        forwards that never dispatch (draft/speculative steps, suppressed
+        capture runs) do not leave gaps that would desynchronize the FFN
+        side's stream-derived ordinals. Backend connectors may override this
+        to scope IDs per source engine.
+        """
+        counter = self._trace_tx_counter
+        self._trace_tx_counter = counter + 1
+        return f"afd-npu-{counter}"
 
     # ==============================
     # Lifecycle methods

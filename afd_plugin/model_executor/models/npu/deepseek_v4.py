@@ -688,6 +688,7 @@ def _run_async_moe_ubatch_forward(
             layer_idx=layer.layer_idx,
             stage_idx=stage_idx,
             seq_len=int(dispatch.hidden_states.shape[0]),
+            transaction_id=afd_metadata.ensure_transaction_id(),
         )
         afd_metadata.connector.send_attn_output(
             dispatch.hidden_states,

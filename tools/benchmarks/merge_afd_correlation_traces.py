@@ -574,6 +574,12 @@ def _build_flow_events(
             (sidecar.pid, str(event["event"]), str(event["phase"]))
             for sidecar, event, _ in entries
         }
+        # Expert routing and DP topology mean not every flow passes through
+        # every rank; only flag ranks that participated in this flow but have
+        # an unpaired begin/end phase for an event they started.
+        participating_pids = {
+            sidecar.pid for sidecar, _, _ in entries
+        }
         missing_participants = [
             {
                 "sidecar": str(sidecar.path),
@@ -587,11 +593,13 @@ def _build_flow_events(
                 ],
             }
             for sidecar in sidecars
-            for event_name in ROLE_FLOW_EVENTS.get(
-                str(sidecar.identity["role"]),
-                frozenset(),
-            )
+            if sidecar.pid in participating_pids
+            for event_name in present_events
             if any(
+                (sidecar.pid, event_name, phase) in present_phases
+                for phase in ("begin", "end")
+            )
+            and any(
                 (sidecar.pid, event_name, phase) not in present_phases
                 for phase in ("begin", "end")
             )

@@ -194,8 +194,14 @@ class AFDCorrelationTraceRecorder:
         stage_idx: int | None = None,
         num_tokens: int | None = None,
         outcome: str | None = None,
+        monotonic_ns: int | None = None,
     ) -> None:
-        """Append one event — streamed to the sidecar file immediately."""
+        """Append one event — streamed to the sidecar file immediately.
+
+        ``monotonic_ns`` overrides the event timestamp; pass a timestamp
+        captured before the wrapped operation when the flow identity is only
+        known after it completes (deferred emission).
+        """
 
         if not self.enabled:
             return
@@ -215,7 +221,11 @@ class AFDCorrelationTraceRecorder:
                     {
                         "record_type": "event",
                         "sequence": sequence,
-                        "monotonic_ns": _monotonic_raw_ns(),
+                        "monotonic_ns": (
+                            monotonic_ns
+                            if monotonic_ns is not None
+                            else _monotonic_raw_ns()
+                        ),
                         "event": event,
                         "phase": phase,
                         "flow_id": flow_id,
@@ -285,6 +295,20 @@ class AFDCorrelationTraceRecorder:
                 num_tokens=num_tokens,
                 outcome=outcome,
             )
+
+    def emit_profiler_marker(self, event: str, flow_id: str | None) -> None:
+        """Emit a zero-duration profiler marker for an already-finished op.
+
+        Used when the flow identity is only known after the device operation
+        was enqueued (the CAM receive payload carries the source rank/layer).
+        The marker lands immediately after the operation in the profiler
+        stream, preserving the FIFO order the merge tool uses to pair markers
+        with device operations.
+        """
+        if not self.enabled:
+            return
+        with _record_function_context(_profiler_marker(event, flow_id)):
+            pass
 
     def close(self) -> Path | None:
         """Finalize the sidecar and return its path.
@@ -381,6 +405,11 @@ def _monotonic_raw_ns() -> int:
     if raw_clock is None:
         return time.monotonic_ns()
     return time.clock_gettime_ns(raw_clock)
+
+
+def monotonic_raw_ns() -> int:
+    """Public accessor for the sidecar clock (CLOCK_MONOTONIC_RAW)."""
+    return _monotonic_raw_ns()
 
 
 def _record_function_context(marker: str) -> AbstractContextManager[object]:
