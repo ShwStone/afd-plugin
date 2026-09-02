@@ -221,6 +221,83 @@ def test_load_unfinished_sidecar_keeps_complete_records(tmp_path: Path) -> None:
     assert sidecar.summary is None
 
 
+def test_merge_aligns_deferred_markers_to_end_events(tmp_path: Path) -> None:
+    """Deferred dispatch_recv markers are emitted after the receive op, so
+    they correspond to the sidecar END event, not the begin. Alignment must
+    pick the nearest phase and keep the clock shift constant."""
+    # begin at 1.0s, end at 5.0s (a recv that blocked 4s); markers at the end.
+    events = [
+        {
+            "event": "afd.cam.dispatch_recv",
+            "flow_id": "abcdef0123456789",
+            "transaction_id": "afd-npu-e0-0",
+            "layer_idx": 0,
+            "stage_idx": 0,
+            "phase": "begin",
+            "monotonic_ns": 1_000_000,
+        },
+        {
+            "event": "afd.cam.dispatch_recv",
+            "flow_id": "abcdef0123456789",
+            "transaction_id": "afd-npu-e0-0",
+            "layer_idx": 0,
+            "stage_idx": 0,
+            "phase": "end",
+            "monotonic_ns": 5_000_000,
+            "outcome": "ok",
+        },
+    ]
+    sidecar = Sidecar(
+        path=Path("ffn.jsonl"),
+        metadata={
+            "session_id": "test-session",
+            "dropped_events": 0,
+            "identity": {
+                "role": "ffn",
+                "role_rank": 0,
+                "hostname": "host",
+                "pid": 13,
+            },
+        },
+        anchors=[{"monotonic_ns": 0, "realtime_ns": 1_000_000_000}],
+        events=events,
+    )
+    assign_clock_transforms([sidecar], [])
+    # Marker ts = epoch us of the END event (1_000_500 us), plus a fixed
+    # 10us profiler-vs-sidecar offset; a begin-anchored match would be 4ms off.
+    profiler_path = tmp_path / "ffn-profiler.json"
+    profiler_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {
+                        "name": "afd.cam.dispatch_recv flow_id=abcdef0123456789",
+                        "cat": "mstx",
+                        "ph": "X",
+                        "pid": 10,
+                        "tid": 10,
+                        "ts": 1_005_010.0,
+                        "dur": 0.5,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    trace, report = build_merged_trace([sidecar], [(sidecar.path, profiler_path)])
+    diag = report["profiler_traces"][0]
+    assert diag["status"] == "aligned"
+    assert diag["marker_delta_spread_us"] < 1.0
+    shifted = [
+        e
+        for e in trace["traceEvents"]
+        if str(e.get("name", "")).startswith("afd.") and e.get("cat") == "mstx"
+    ]
+    # Origin is the sidecar begin (1ms); the end sits at 4000us relative and
+    # the marker must be shifted onto it (not onto the begin).
+    assert abs(shifted[0]["ts"] - 4_000.0) < 1.0
+
+
 def test_merge_correlates_complete_cross_host_flow(tmp_path: Path) -> None:
     attention = _sidecar(
         path="attention.jsonl",

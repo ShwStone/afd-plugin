@@ -10,6 +10,7 @@ profiler traces that could not be aligned to sidecar markers.
 from __future__ import annotations
 
 import argparse
+import bisect
 import gzip
 import json
 import re
@@ -742,16 +743,45 @@ def _align_profiler_events(
 
     if sidecar.transform is None:
         raise RuntimeError("clock transform has not been assigned")
-    deltas_us: list[float] = []
+
+    # Index the sidecar's begin AND end events per (event, flow_id). Markers
+    # that wrap their operation correspond to the sidecar begin; deferred
+    # markers (emitted after a receive whose identity comes from the payload)
+    # correspond to the sidecar end. Matching each marker to the nearest
+    # sidecar phase keeps one constant clock shift per trace either way.
+    sidecar_times: dict[tuple[str, str | None], list[float]] = defaultdict(list)
     for event in sidecar.events:
         key = (str(event["event"]), event.get("flow_id"))
-        matches = marker_times.get(key)
-        if event["phase"] != "begin" or not matches:
+        if event["phase"] not in ("begin", "end"):
+            continue
+        if key not in marker_times:
             continue
         global_us = (
             sidecar.transform.to_global_ns(int(event["monotonic_ns"])) - origin_ns
         ) / NANOSECONDS_PER_MICROSECOND
-        deltas_us.append(global_us - matches.pop(0))
+        sidecar_times[key].append(global_us)
+    for times in sidecar_times.values():
+        times.sort()
+
+    deltas_us: list[float] = []
+    for key, marker_list in marker_times.items():
+        times = sidecar_times.get(key)
+        if not times:
+            continue
+        consumed = 0
+        for marker_ts in marker_list:
+            # Nearest unconsumed sidecar phase timestamp.
+            pos = bisect.bisect_left(times, marker_ts, consumed)
+            candidates = []
+            if pos < len(times):
+                candidates.append(times[pos])
+            if pos > consumed:
+                candidates.append(times[pos - 1])
+            if not candidates:
+                break
+            best = min(candidates, key=lambda ts: abs(ts - marker_ts))
+            consumed = times.index(best, consumed) + 1
+            deltas_us.append(best - marker_ts)
 
     if not deltas_us:
         return (
