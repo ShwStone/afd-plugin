@@ -193,6 +193,12 @@ def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
         "get_tp_group",
         lambda: SimpleNamespace(rank_in_group=0, world_size=1),
     )
+    # The DBO yield hook calls a vLLM custom op that only exists on NPU.
+    monkeypatch.setattr(
+        async_forward,
+        "maybe_apply_dbo_yield",
+        lambda hidden_states, *, role: hidden_states,
+    )
 
     forward_context = SimpleNamespace(
         in_profile_run=True,

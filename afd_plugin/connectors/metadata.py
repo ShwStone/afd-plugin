@@ -321,6 +321,14 @@ class AFDForwardContextMetadata:
             self.transaction_id = self.connector.claim_trace_transaction_id()
         return self.transaction_id
 
+    def clone(self) -> AFDForwardContextMetadata:
+        cloned = copy.copy(self)
+        cloned.tokens_start_loc = list(self.tokens_start_loc)
+        cloned.requests_start_loc = list(self.requests_start_loc)
+        cloned.tokens_lens = list(self.tokens_lens)
+        cloned.tokens_unpadded_lens = list(self.tokens_unpadded_lens)
+        return cloned
+
 
 def ensure_afd_transaction_id(
     afd_metadata: AFDForwardContextMetadata,
@@ -334,14 +342,6 @@ def ensure_afd_transaction_id(
     if ensure is not None:
         return ensure()
     return getattr(afd_metadata, "transaction_id", None)
-
-    def clone(self) -> AFDForwardContextMetadata:
-        cloned = copy.copy(self)
-        cloned.tokens_start_loc = list(self.tokens_start_loc)
-        cloned.requests_start_loc = list(self.requests_start_loc)
-        cloned.tokens_lens = list(self.tokens_lens)
-        cloned.tokens_unpadded_lens = list(self.tokens_unpadded_lens)
-        return cloned
 
 
 def _to_int(value: object) -> int:
