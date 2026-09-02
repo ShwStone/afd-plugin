@@ -486,7 +486,13 @@ def process_input_socket(
         poller.register(output_back, zmq.POLLIN)
         last_publish_time = 0
         while True:
-            # ### PATCH START: AFD monotonic stats/debt publication deadline
+            # ### PATCH START: AFD monotonic publication deadline
+            # Only lockstep DP engines have a shared step whose rank-local
+            # updates need the short aggregation window; independent engines
+            # must not delay debt-expiry publication behind lockstep waits.
+            min_timeout = (
+                50 if self.enable_wave_coordination and last_step_counts is None else 0
+            )
             now_ms = int(time.monotonic() * 1000)
             publish_deadline_ms = _get_stats_publish_deadline_ms(
                 last_publish_time,
@@ -495,17 +501,8 @@ def process_input_socket(
                 prefill_token_debt_update_ms if prefill_token_debt_seen else None,
             )
             wait_for = max(0, publish_deadline_ms - now_ms)
-            # ### PATCH END: AFD monotonic stats/debt publication deadline
-
-            # ### PATCH START: AFD independent request-count cadence
-            # Only lockstep DP engines have a shared step whose rank-local
-            # updates need a short aggregation window.
-            min_timeout = (
-                50 if self.enable_wave_coordination and last_step_counts is None else 0
-            )
-            # ### PATCH END: AFD independent request-count cadence
-
             events = poller.poll(timeout=max(min_timeout, wait_for))
+            # ### PATCH END: AFD monotonic publication deadline
             if not events:
                 # Poller timeout - publish current stats to front-ends.
                 # ### PATCH START: AFD prefill-token debt publication
@@ -675,33 +672,26 @@ def process_input_socket(
                     stats[0] = scheduler_stats.num_waiting_reqs
                     stats[1] = scheduler_stats.num_running_reqs
                     # ### PATCH START: AFD asynchronous prefill-token debt
-                    connector_stats = scheduler_stats.kv_connector_stats
+                    # The plugin-owned payload is version-gated; values are
+                    # re-validated by the frontend before routing uses them.
+                    token_stats = (scheduler_stats.kv_connector_stats or {}).get(
+                        AFD_DPLB_STATS_KEY
+                    )
                     if (
-                        isinstance(connector_stats, dict)
-                        and AFD_DPLB_STATS_KEY in connector_stats
+                        isinstance(token_stats, dict)
+                        and token_stats.get("version") == AFD_DPLB_STATS_VERSION
                     ):
-                        token_stats = connector_stats[AFD_DPLB_STATS_KEY]
-                        if (
-                            isinstance(token_stats, dict)
-                            and token_stats.get("version") == AFD_DPLB_STATS_VERSION
-                        ):
-                            token_debt = token_stats.get("prefill_token_debt")
-                            if not (
-                                token_debt is None
-                                or isinstance(token_debt, int)
-                                and not isinstance(token_debt, bool)
-                                and token_debt >= 0
-                            ):
-                                token_debt = None
-                            prefill_token_debts[eng_index] = token_debt
-                            prefill_token_debt_update_ms[eng_index] = int(
-                                time.monotonic() * 1000
-                            )
-                            if not prefill_token_debt_seen and last_publish_time == 0:
-                                last_publish_time = prefill_token_debt_update_ms[
-                                    eng_index
-                                ]
-                            prefill_token_debt_seen = True
+                        prefill_token_debts[eng_index] = token_stats.get(
+                            "prefill_token_debt"
+                        )
+                        prefill_token_debt_update_ms[eng_index] = int(
+                            time.monotonic() * 1000
+                        )
+                        if not prefill_token_debt_seen and last_publish_time == 0:
+                            # Anchor cadence at the first debt so the first
+                            # frontend update sees a coherent snapshot.
+                            last_publish_time = prefill_token_debt_update_ms[eng_index]
+                        prefill_token_debt_seen = True
                     # ### PATCH END: AFD asynchronous prefill-token debt
                     stats_changed = True
 
@@ -861,7 +851,7 @@ def get_core_engine_for_request(
             if not request_is_eligible:
                 blocked_requests.add(request.request_id)
                 _invalidate_local_prefill_token_debts(current_counts)
-        use_token_score = bool(request_is_eligible and not blocked_requests)
+        use_token_score = request_is_eligible and not blocked_requests
 
         if use_token_score:
             for counts in current_counts:
@@ -869,7 +859,6 @@ def get_core_engine_for_request(
                     len(counts) <= _DPLB_PREFILL_TOKEN_DEBT_INDEX
                     or counts[_DPLB_STATS_VERSION_INDEX] != AFD_DPLB_STATS_VERSION
                     or not isinstance(counts[_DPLB_PREFILL_TOKEN_DEBT_INDEX], int)
-                    or isinstance(counts[_DPLB_PREFILL_TOKEN_DEBT_INDEX], bool)
                     or counts[_DPLB_PREFILL_TOKEN_DEBT_INDEX] < 0
                 ):
                     use_token_score = False
@@ -967,12 +956,11 @@ def _invalidate_local_prefill_token_debts(
 def _get_blocked_prefill_token_dplb_requests(
     client: DPLBAsyncMPClient,
 ) -> set[str]:
-    try:
-        return client.__dict__[_AFD_BLOCKED_REQUESTS_ATTR]
-    except KeyError:
-        blocked_requests: set[str] = set()
-        client.__dict__[_AFD_BLOCKED_REQUESTS_ATTR] = blocked_requests
-        return blocked_requests
+    blocked_requests: set[str] = client.__dict__.setdefault(
+        _AFD_BLOCKED_REQUESTS_ATTR,
+        set(),
+    )
+    return blocked_requests
 
 
 # Patch reason: vLLM completion cleanup only releases abort-routing state, while
