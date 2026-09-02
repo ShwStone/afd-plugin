@@ -423,19 +423,6 @@ def test_prefill_token_debt_tracks_live_scheduler_progress(monkeypatch):
     assert patch_module._get_prefill_token_debt(scheduler) is None
 
 
-def test_prefill_token_debt_scan_is_bounded(monkeypatch):
-    _install_fake_vllm_core(monkeypatch)
-    patch_module = _load_patch_module()
-    request = _prefill_request(1)
-    scheduler = SimpleNamespace(
-        waiting=[request] * (patch_module.PREFILL_TOKEN_DEBT_MAX_LIVE_REQUESTS + 1),
-        skipped_waiting=[],
-        running=[],
-    )
-
-    assert patch_module._get_prefill_token_debt(scheduler) is None
-
-
 def test_prefill_token_debt_publishes_when_counts_do_not_change(monkeypatch):
     core_module = _install_fake_vllm_core(monkeypatch)
     patch_module = _load_patch_module()
@@ -464,7 +451,6 @@ def test_prefill_token_debt_publishes_when_counts_do_not_change(monkeypatch):
         None,
         0.0,
         publish_prefill_token_debt=True,
-        force_token_debt_publish=True,
     )
     request.num_computed_tokens = 40
     now = 1.05

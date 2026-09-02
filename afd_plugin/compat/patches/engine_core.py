@@ -475,8 +475,8 @@ def _run_async_attention_busy_loop(self) -> None:
     )
     last_request_counts = (0, 0)
     last_prefill_token_debt: int | None = None
+    # 0.0 makes the first cadence check immediately due.
     last_token_debt_publish_time = 0.0
-    force_token_debt_publish = publish_prefill_token_debt
     while self._handle_shutdown():
         self._process_input_queue()
         (
@@ -489,9 +489,7 @@ def _run_async_attention_busy_loop(self) -> None:
             last_prefill_token_debt,
             last_token_debt_publish_time,
             publish_prefill_token_debt=publish_prefill_token_debt,
-            force_token_debt_publish=force_token_debt_publish,
         )
-        force_token_debt_publish = False
         self._process_engine_step()
         (
             last_request_counts,
@@ -515,7 +513,6 @@ def _publish_async_attention_load_stats(
     last_token_debt_publish_time: float,
     *,
     publish_prefill_token_debt: bool,
-    force_token_debt_publish: bool = False,
 ) -> tuple[tuple[int, int], int | None, float]:
     """Publish changed request counts and bounded-cadence prefill token debt."""
 
@@ -532,11 +529,7 @@ def _publish_async_attention_load_stats(
     now = time.monotonic()
     token_debt_report_due = bool(
         publish_prefill_token_debt
-        and (
-            force_token_debt_publish
-            or now - last_token_debt_publish_time
-            >= PREFILL_TOKEN_DEBT_REPORT_INTERVAL_S
-        )
+        and now - last_token_debt_publish_time >= PREFILL_TOKEN_DEBT_REPORT_INTERVAL_S
     )
     if token_debt_report_due:
         prefill_token_debt = _get_prefill_token_debt(self.scheduler)

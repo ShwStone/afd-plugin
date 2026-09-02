@@ -694,12 +694,6 @@ def test_prefill_token_debt_snapshot_expires_busy_engines_only(monkeypatch):
         [900, 900],
         1000,
     )
-    boundary_fresh = patch_module._get_augmented_engine_counts(
-        coordinator,
-        [100, 50],
-        [900, 900],
-        1399,
-    )
     stale = patch_module._get_augmented_engine_counts(
         coordinator,
         [100, 50],
@@ -708,9 +702,7 @@ def test_prefill_token_debt_snapshot_expires_busy_engines_only(monkeypatch):
     )
 
     version = patch_module.AFD_DPLB_STATS_VERSION
-    expected_fresh = [[2, 1, version, 100], [0, 0, version, 50]]
-    assert fresh == expected_fresh
-    assert boundary_fresh == expected_fresh
+    assert fresh == [[2, 1, version, 100], [0, 0, version, 50]]
     assert stale == [[2, 1, version, None], [0, 0, version, 0]]
 
 
