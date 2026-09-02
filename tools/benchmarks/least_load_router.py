@@ -136,7 +136,7 @@ class Router:
             body = await request.read()
             headers = {k: v for k, v in request.headers.items()
                        if k.lower() not in HOP_BY_HOP}
-            url = be.url + request.rel_url
+            url = be.url + str(request.rel_url)
             async with self.session.request(
                 request.method, url, headers=headers, data=body
             ) as resp:
