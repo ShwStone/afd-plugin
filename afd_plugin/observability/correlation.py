@@ -13,13 +13,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import socket
 import threading
 import time
 from collections.abc import Generator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Final, Literal, TextIO
@@ -31,7 +32,7 @@ AFD_TRACE_ENABLE_ENV: Final[str] = "AFD_TRACE_ENABLE"
 AFD_TRACE_SESSION_ID_ENV: Final[str] = "AFD_TRACE_SESSION_ID"
 AFD_TRACE_DIR_ENV: Final[str] = "AFD_TRACE_DIR"
 AFD_TRACE_MAX_EVENTS_ENV: Final[str] = "AFD_TRACE_MAX_EVENTS"
-AFD_TRACE_SCHEMA_VERSION: Final[int] = 1
+AFD_TRACE_SCHEMA_VERSION: Final[int] = 2
 DEFAULT_TRACE_DIR: Final[str] = "/tmp/afd-correlation-trace"
 DEFAULT_MAX_EVENTS: Final[int] = 200_000
 FLOW_DIGEST_BYTES: Final[int] = 8
@@ -39,6 +40,8 @@ TEMP_FILE_SUFFIX: Final[str] = ".tmp"
 _TRUE_ENV_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
 _FALSE_ENV_VALUES: Final[frozenset[str]] = frozenset({"0", "false", "no", "off"})
 _SAFE_FILENAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"[^A-Za-z0-9_.-]+")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +114,7 @@ def afd_correlation_trace_config() -> AFDCorrelationTraceConfig:
 
 
 class AFDCorrelationTraceRecorder:
-    """Buffer correlation events and atomically flush a JSONL sidecar."""
+    """Stream correlation events and atomically finalize a JSONL sidecar."""
 
     def __init__(
         self,
@@ -131,17 +134,11 @@ class AFDCorrelationTraceRecorder:
             return
         output_path = self._build_output_path()
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._temp_path = output_path.with_name(
-            output_path.name + TEMP_FILE_SUFFIX
-        )
+        self._temp_path = output_path.with_name(output_path.name + TEMP_FILE_SUFFIX)
         # Open the sidecar file immediately and write the header
         # records.  Every subsequent event is streamed to disk so that
         # even a SIGKILL preserves everything written so far.
-        try:
-            self._temp_file = self._temp_path.open("w", encoding="utf-8")
-        except OSError:
-            self._temp_file = None
-            return
+        self._temp_file = self._temp_path.open("w", encoding="utf-8")
         metadata = {
             "record_type": "metadata",
             "schema_version": AFD_TRACE_SCHEMA_VERSION,
@@ -149,7 +146,6 @@ class AFDCorrelationTraceRecorder:
             "identity": asdict(self.identity),
             "clock": "CLOCK_MONOTONIC_RAW",
             "max_events": self.config.max_events,
-            "dropped_events": 0,
         }
         _write_json_line(self._temp_file, metadata)
         start_anchor = _capture_clock_anchor("start")
@@ -209,29 +205,38 @@ class AFDCorrelationTraceRecorder:
             if self._sequence >= self.config.max_events:
                 self._dropped_events += 1
                 return
+            if self._temp_file is None:
+                self._dropped_events += 1
+                return
             sequence = self._sequence
+            try:
+                _write_json_line(
+                    self._temp_file,
+                    {
+                        "record_type": "event",
+                        "sequence": sequence,
+                        "monotonic_ns": _monotonic_raw_ns(),
+                        "event": event,
+                        "phase": phase,
+                        "flow_id": flow_id,
+                        "transaction_id": transaction_id,
+                        "layer_idx": layer_idx,
+                        "stage_idx": stage_idx,
+                        "num_tokens": num_tokens,
+                        "outcome": outcome,
+                    },
+                )
+                self._temp_file.flush()
+            except OSError:
+                self._dropped_events += 1
+                logger.exception(
+                    "AFD correlation sidecar write failed; disabling recorder",
+                )
+                with suppress(OSError):
+                    self._temp_file.close()
+                self._temp_file = None
+                return
             self._sequence += 1
-            if self._temp_file is not None:
-                try:
-                    _write_json_line(
-                        self._temp_file,
-                        {
-                            "record_type": "event",
-                            "sequence": sequence,
-                            "monotonic_ns": _monotonic_raw_ns(),
-                            "event": event,
-                            "phase": phase,
-                            "flow_id": flow_id,
-                            "transaction_id": transaction_id,
-                            "layer_idx": layer_idx,
-                            "stage_idx": stage_idx,
-                            "num_tokens": num_tokens,
-                            "outcome": outcome,
-                        },
-                    )
-                    self._temp_file.flush()
-                except OSError:
-                    self._temp_file = None
 
     @contextmanager
     def record_range(
@@ -294,6 +299,7 @@ class AFDCorrelationTraceRecorder:
                 return self._output_path
             self._closed = True
         output_path = self._build_output_path()
+        finalized = False
         if self._temp_file is not None:
             try:
                 stop_anchor = _capture_clock_anchor("stop")
@@ -301,15 +307,30 @@ class AFDCorrelationTraceRecorder:
                     self._temp_file,
                     {"record_type": "clock_anchor", **asdict(stop_anchor)},
                 )
+                _write_json_line(
+                    self._temp_file,
+                    {
+                        "record_type": "summary",
+                        "event_count": self._sequence,
+                        "dropped_events": self._dropped_events,
+                    },
+                )
                 self._temp_file.flush()
                 self._temp_file.close()
+                finalized = True
             except OSError:
-                pass
+                logger.exception(
+                    "AFD correlation sidecar finalization failed; keeping temp file",
+                )
+                with suppress(OSError):
+                    self._temp_file.close()
             self._temp_file = None
-        if self._temp_path is not None and self._temp_path.exists():
+        if finalized and self._temp_path is not None:
             os.replace(self._temp_path, output_path)
-        self._output_path = output_path
-        return output_path
+            self._output_path = output_path
+        elif self._temp_path is not None and self._temp_path.exists():
+            self._output_path = self._temp_path
+        return self._output_path
 
     def _build_output_path(self) -> Path:
         session_id = _safe_filename_component(str(self.config.session_id))

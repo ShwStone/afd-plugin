@@ -71,6 +71,11 @@ case "$STAGE2_VARIANT" in
 esac
 echo "[stage2] variant=$STAGE2_VARIANT ubatch=$MOE_UBATCH split=$MOE_SPLIT"
 
+PROFILER_ARGS=()
+if [[ -n "${VLLM_TORCH_PROFILER_DIR:-}" ]]; then
+  PROFILER_ARGS=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${VLLM_TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true,\"ignore_frontend\":true}")
+fi
+
 cd "$REPO"
 exec vllm serve "$MODEL_PATH" \
   --port 8001 \
@@ -83,6 +88,7 @@ exec vllm serve "$MODEL_PATH" \
   --data-parallel-size 8 \
   --enable-expert-parallel \
   "${PREFIX_ARGS[@]}" \
+  "${PROFILER_ARGS[@]}" \
   --trust-remote-code \
   --seed 1024 \
   --additional-config "{

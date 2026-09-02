@@ -11,6 +11,7 @@ from tools.benchmarks.merge_afd_correlation_traces import (
     assign_clock_transforms,
     best_clock_sample,
     build_merged_trace,
+    load_sidecar,
 )
 
 
@@ -89,6 +90,43 @@ def test_best_clock_sample_selects_minimum_round_trip() -> None:
     assert uncertainty_ns == 5
 
 
+def test_load_unfinished_sidecar_keeps_complete_records(tmp_path: Path) -> None:
+    path = tmp_path / "afd-trace-test-attention-rank0-pid1-host.jsonl.tmp"
+    records = [
+        {
+            "record_type": "metadata",
+            "schema_version": 2,
+            "session_id": "test-session",
+            "identity": {
+                "role": "attention",
+                "role_rank": 0,
+                "hostname": "host",
+                "pid": 1,
+            },
+        },
+        {
+            "record_type": "clock_anchor",
+            "monotonic_ns": 100,
+            "realtime_ns": 1_000,
+        },
+        {
+            "record_type": "event",
+            "event": "afd.test",
+            "phase": "instant",
+            "monotonic_ns": 110,
+        },
+    ]
+    path.write_text(
+        "\n".join(json.dumps(record) for record in records) + '\n{"partial":',
+        encoding="utf-8",
+    )
+
+    sidecar = load_sidecar(path)
+
+    assert len(sidecar.events) == 1
+    assert sidecar.summary is None
+
+
 def test_merge_correlates_complete_cross_host_flow(tmp_path: Path) -> None:
     attention = _sidecar(
         path="attention.jsonl",
@@ -133,10 +171,7 @@ def test_merge_correlates_complete_cross_host_flow(tmp_path: Path) -> None:
             {
                 "traceEvents": [
                     {
-                        "name": (
-                            "afd.cam.dispatch_send "
-                            "flow_id=abcdef0123456789"
-                        ),
+                        "name": ("afd.cam.dispatch_send flow_id=abcdef0123456789"),
                         "cat": "mstx",
                         "ph": "X",
                         "pid": 10,
@@ -174,9 +209,7 @@ def test_merge_correlates_complete_cross_host_flow(tmp_path: Path) -> None:
     assert any(event.get("ph") == "f" for event in trace["traceEvents"])
 
     flow_events = [
-        event
-        for event in trace["traceEvents"]
-        if event.get("cat") == "afd.flow"
+        event for event in trace["traceEvents"] if event.get("cat") == "afd.flow"
     ]
     flow_keys: dict[int, set[tuple[object, object, object]]] = {}
     for event in flow_events:
@@ -187,14 +220,96 @@ def test_merge_correlates_complete_cross_host_flow(tmp_path: Path) -> None:
     assert all(len(keys) == 1 for keys in flow_keys.values())
 
     device_flow_events = [
-        event
-        for event in trace["traceEvents"]
-        if event.get("cat") == "afd.device-flow"
+        event for event in trace["traceEvents"] if event.get("cat") == "afd.device-flow"
     ]
     assert [event["ph"] for event in device_flow_events] == ["s", "f"]
-    assert len(
-        {
-            (event["cat"], event["name"], event["id"])
-            for event in device_flow_events
-        }
-    ) == 1
+    assert (
+        len(
+            {(event["cat"], event["name"], event["id"]) for event in device_flow_events}
+        )
+        == 1
+    )
+
+
+def test_merge_reports_summary_drops_and_incomplete_ranges() -> None:
+    sidecar = _sidecar(
+        path="unfinished-range.jsonl",
+        role="attention",
+        hostname="reference",
+        anchor_mono_ns=1_000,
+        anchor_realtime_ns=1_000_000,
+        events=_range_events("afd.cam.dispatch_send", 1_100)[:1],
+    )
+    sidecar.summary = {"dropped_events": 3, "event_count": 1}
+    assign_clock_transforms([sidecar], [])
+
+    _, report = build_merged_trace([sidecar], [])
+
+    assert report["dropped_events"] == 3
+    assert report["incomplete_ranges"][0]["missing_phase"] == "end"
+
+
+def test_device_flows_stay_with_their_profiler_sidecar(tmp_path: Path) -> None:
+    first = _sidecar(
+        path="first.jsonl",
+        role="attention",
+        hostname="reference",
+        anchor_mono_ns=1_000,
+        anchor_realtime_ns=1_000_000,
+        events=_range_events("afd.cam.dispatch_send", 1_100),
+    )
+    second = _sidecar(
+        path="second.jsonl",
+        role="attention",
+        hostname="reference",
+        anchor_mono_ns=2_000,
+        anchor_realtime_ns=2_000_000,
+        events=_range_events("afd.cam.dispatch_send", 2_100),
+    )
+    assign_clock_transforms([first, second], [])
+
+    profiler_pairs = []
+    for index, (sidecar, marker_ts, op_ts) in enumerate(
+        ((first, 100.0, 400.0), (second, 200.0, 300.0)),
+    ):
+        path = tmp_path / f"profiler-{index}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {
+                            "name": ("afd.cam.dispatch_send flow_id=abcdef0123456789"),
+                            "ph": "X",
+                            "pid": 10,
+                            "tid": 10,
+                            "ts": marker_ts,
+                            "dur": 1.0,
+                        },
+                        {
+                            "name": "CamMoeDistributeDispatchSend",
+                            "ph": "X",
+                            "pid": 20,
+                            "tid": 20,
+                            "ts": op_ts,
+                            "dur": 1.0,
+                        },
+                    ],
+                },
+            ),
+            encoding="utf-8",
+        )
+        profiler_pairs.append((sidecar.path, path))
+
+    trace, report = build_merged_trace([first, second], profiler_pairs)
+
+    endpoints_by_flow: dict[int, set[int]] = {}
+    for event in trace["traceEvents"]:
+        if event.get("cat") == "afd.device-flow":
+            endpoints_by_flow.setdefault(int(event["id"]), set()).add(
+                int(event["pid"]),
+            )
+    assert set(map(frozenset, endpoints_by_flow.values())) == {
+        frozenset({1, 4}),
+        frozenset({2, 6}),
+    }
+    assert report["device_flows"]["skipped_ambiguous_correlation"] == 0

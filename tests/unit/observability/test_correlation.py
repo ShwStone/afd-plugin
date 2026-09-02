@@ -111,5 +111,13 @@ def test_recorder_reports_dropped_events(tmp_path: Path) -> None:
     output_path = recorder.close()
 
     assert output_path is not None
-    metadata = json.loads(output_path.read_text(encoding="utf-8").splitlines()[0])
-    assert metadata["dropped_events"] == 0  # streaming: metadata frozen at init
+    records = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+    ]
+    summary = next(record for record in records if record["record_type"] == "summary")
+    assert summary == {
+        "record_type": "summary",
+        "event_count": 1,
+        "dropped_events": 1,
+    }

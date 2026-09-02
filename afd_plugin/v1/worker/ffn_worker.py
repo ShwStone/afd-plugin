@@ -80,6 +80,20 @@ class AFDFFNWorker(Worker):
 
         torch.accelerator.empty_cache()
 
+    # Override reason: FFN compute runs in the connector daemon and never
+    # advances the upstream worker profiler.
+    # Behavior: route the native vLLM profile RPC to the AFD FFN runner.
+    # Signature matches vLLM 0.26 Worker.profile; no parameters are added.
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+    ) -> None:
+        if is_start:
+            self.model_runner.start_profile(profile_prefix, self.rank)
+        else:
+            self.model_runner.stop_profile()
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """FFN workers do not allocate KV cache."""
 

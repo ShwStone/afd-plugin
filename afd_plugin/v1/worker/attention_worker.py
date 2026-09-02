@@ -62,5 +62,19 @@ class AFDAttentionWorker(Worker):
 
         torch.accelerator.empty_cache()
 
+    # Override reason: the upstream worker owns a separate profiler that does
+    # not preserve AFD's role-specific runner lifecycle.
+    # Behavior: route the native vLLM profile RPC to the AFD Attention runner.
+    # Signature matches vLLM 0.26 Worker.profile; no parameters are added.
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+    ) -> None:
+        if is_start:
+            self.model_runner.start_profile(profile_prefix, self.rank)
+        else:
+            self.model_runner.stop_profile()
+
 
 __all__ = ["AFDAttentionWorker"]

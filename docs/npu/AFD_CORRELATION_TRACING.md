@@ -57,16 +57,23 @@ export AFD_TRACE_DIR=/path/shared-or-collected-later/afd-sidecars
 `AFD_TRACE_SESSION_ID` must be identical on every host and unique for one
 launch. `AFD_TRACE_MAX_EVENTS` optionally limits recorded events per process;
 the default is 200,000. Every event is immediately written and flushed to a
-temporary sidecar, so a hard kill preserves the completed prefix. Normal
-connector shutdown adds the final clock anchor and atomically renames the
-temporary file to `.jsonl`.
+temporary sidecar, so a hard kill preserves the completed prefix. Merge tools
+recover a truncated final line from `.jsonl.tmp`. Normal connector shutdown
+adds the final clock anchor and an event/drop summary before atomically renaming
+the file to `.jsonl`.
 
-Enable the existing NPU profilers for both roles with the same wait, warmup,
-active, and skip-first values. Correlation sidecars cover the whole process,
-while the named `record_function` markers appear only inside the profiler's
-active window. With AFD-managed MoE microbatching, the FFN profiler advances
-once per complete Attention transaction rather than once per partial FFN
-receive-loop iteration, so the two role schedules count the same unit of work.
+Correlation sidecars can be collected without an accelerator profiler. Set
+`FP_CORRELATION=1` for `fp_orchestrate.py`, or `CORRELATION=1` for
+`run_stage2_l0.sh`; do not set `FP_PROFILE`/`PROFILE`. This records only the
+process-lifetime JSONL sidecars and does not register or call vLLM's profiler
+endpoints.
+
+To align sidecars with device events, launch both roles with vLLM
+`--profiler-config`, then bound the profiler capture with `POST /start_profile`
+and `POST /stop_profile`. Start FFN before Attention and stop Attention before
+FFN. Sidecars still cover the process lifetime, while MSTX markers appear only
+inside that explicit profiler window. AFD no longer supports an independent
+fixed-step profiler schedule.
 
 ## Calibrate clocks across hosts
 
@@ -121,12 +128,14 @@ Open `afd-merged.json` in Perfetto or a Chrome trace viewer. The adjacent
 lists:
 
 - the alignment method and uncertainty for every process;
-- events dropped because the configured buffer limit was reached;
-- events without a flow ID and ranges that ended with an error;
-- incomplete flows and their missing phases;
+- finalized versus recovered temporary sidecars and event-count consistency;
+- events dropped because the configured limit was reached;
+- events without a flow ID, unmatched begin/end ranges, and error outcomes;
+- incomplete flows, including missing phases on individual role ranks;
 - flows whose cross-host order is reversed after clock correction; and
 - profiler traces that lack matching AFD markers; and
-- correlation-to-device flow counts.
+- per-profiler correlation-to-device flow counts, including ambiguous links
+  rejected during multi-rank merging.
 
 To add raw `torch_npu` traces, map each trace to the exact sidecar produced by
 the same process:
@@ -152,6 +161,7 @@ arrows from each correlation range to the device operation it enqueues. The
 standalone `tools.benchmarks.link_afd_device_flows` command is only needed to
 upgrade a merged trace produced by an older version of the merge tool.
 
-If a host has no clock calibration file, the tool falls back to that host's
-realtime anchor and explicitly records that limitation. This is useful for a
-rough view, not for claiming precise cross-host communication latency.
+For a multi-host session, the merge tools require one reference host and one
+clock-calibration file for every other host. They reject incomplete calibration
+instead of silently assuming synchronized realtime clocks. Single-host merges
+continue to use the local realtime anchor.

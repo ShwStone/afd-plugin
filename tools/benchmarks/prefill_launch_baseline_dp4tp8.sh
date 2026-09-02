@@ -57,6 +57,11 @@ if [[ "$DP_START_RANK" != "0" ]]; then
   HEADLESS_ARGS=(--headless)
 fi
 
+PROFILER_ARGS=()
+if [[ -n "${VLLM_TORCH_PROFILER_DIR:-}" ]]; then
+  PROFILER_ARGS=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${VLLM_TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true,\"ignore_frontend\":true}")
+fi
+
 cd "$REPO"
 exec vllm serve "$MODEL_PATH" \
   --host 0.0.0.0 \
@@ -78,6 +83,7 @@ exec vllm serve "$MODEL_PATH" \
   --trust-remote-code \
   --gpu-memory-utilization 0.90 \
   "${PREFIX_ARGS[@]}" \
+  "${PROFILER_ARGS[@]}" \
   --enable-expert-parallel \
   --additional-config '{
     "enable_force_load_balance": true

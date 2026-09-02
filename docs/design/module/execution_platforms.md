@@ -176,10 +176,14 @@ The current AFD policy accepts exactly two native ubatches.
 ### CUDA profiling
 
 Attention and FFN runners create separate optional `torch.profiler` instances.
-They are controlled by `AFD_GPU_ATTENTION_PROFILER_*` and
-`AFD_GPU_FFN_PROFILER_*` environment prefixes. Each runner advances its
-profiler on execution and stops it during shutdown. `VLLM_TORCH_PROFILER_DIR`
-is a fallback trace directory.
+The preferred mode uses vLLM's `--profiler-config` and the native
+`POST /start_profile` / `POST /stop_profile` APIs. AFD workers route those RPCs
+to their role-specific runners, which create profilers lazily and retain the
+existing execution-step annotations without using a fixed-step collection
+window. Attention and FFN are independent vLLM servers, so callers start FFN
+before Attention and stop Attention before FFN. AFD does not support a separate
+environment-variable schedule; profiling must be enabled with
+`--profiler-config` and controlled through the two HTTP endpoints.
 
 ## NPU mechanisms
 
@@ -276,12 +280,16 @@ real CAM dispatch/combine operator namespace. Its loader verifies
 
 ### NPU profiling
 
-Attention and FFN use independent optional `torch_npu.profiler` instances,
-controlled by `AFD_NPU_ATTENTION_PROFILER_*` and
-`AFD_NPU_FFN_PROFILER_*`. The helper configures CPU/NPU activities, Level 2
-experimental output, role-specific defaults, optional stacks/modules, and a
-TensorBoard trace handler. Runners step the profiler on execution and stop it
-during shutdown.
+Attention and FFN use independent optional `torch_npu.profiler` instances.
+The preferred mode uses vLLM's `--profiler-config` and native profile control
+APIs while keeping the profiler plugin-owned: vLLM-Ascend's Level 1 wrapper
+cannot replace AFD's Level 2 output and `mstx=True` correlation markers.
+Profilers are created lazily on `POST /start_profile`, stopped and flushed on
+`POST /stop_profile`, and named by role, distributed rank, and run index.
+Because the roles run in independent servers—and CAMAsync has no control
+plane—clients must call both servers. AFD does not support a separate
+fixed-step environment schedule; profiling must be configured through vLLM and
+bounded by the two HTTP endpoints.
 
 ## Tested runtime matrix
 

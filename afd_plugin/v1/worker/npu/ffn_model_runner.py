@@ -20,6 +20,7 @@ from afd_plugin.compat.npu import (
 )
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
+    start_afd_npu_profiler,
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
@@ -86,13 +87,30 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
         self.graph_pool = (
             current_platform.get_global_graph_pool() if self.use_aclgraph else None
         )
-        self.prof = create_afd_npu_profiler("ffn")
+        self.prof = create_afd_npu_profiler(
+            "ffn",
+            vllm_config.profiler_config,
+        )
         self._afd_connector_work_item_counter = 0
         self._is_shutdown = False
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="ffn")
+
+    def start_profile(
+        self,
+        profile_prefix: str | None,
+        global_rank: int,
+    ) -> None:
+        start_afd_npu_profiler(
+            self.prof,
+            profile_prefix=profile_prefix,
+            global_rank=global_rank,
+        )
+
+    def stop_profile(self) -> None:
+        stop_afd_npu_profiler(self.prof)
 
     def initialize_afd_connector(self) -> None:
         self.connector.init_afd_connector()

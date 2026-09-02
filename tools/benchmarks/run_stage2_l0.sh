@@ -34,11 +34,8 @@ PROM_DIR=/a3_inference/itask/workdir/tq02357756/shwstone/prometheus_tmp
 LOG_DIR=bench_results/logs
 # Stage-3 btsweep extensions (defaults keep Stage-2 behaviour unchanged).
 PROFILE=${PROFILE:-0}
+CORRELATION=${CORRELATION:-0}
 RUN_REPEATS=${RUN_REPEATS:-3}
-PROF_WAIT=${PROF_WAIT:-0}
-PROF_WARMUP=${PROF_WARMUP:-1}
-PROF_ACTIVE=${PROF_ACTIVE:-30}
-PROF_SKIP_FIRST=${PROF_SKIP_FIRST:-20}
 SAMPLER_INTERVAL=${SAMPLER_INTERVAL:-1}
 PROFILE_DIR=""
 
@@ -175,29 +172,27 @@ start_server() {
   local system_label=$1 bt=$2 pc=$3 variant=$4 label=$5
   local varg=""
   [ -n "$variant" ] && varg="STAGE2_VARIANT=$variant"
-  # Stage-3 PROFILE mode: enable torch_npu profiler + AFD layout/op logs so the
-  # L2 replay captures per-rank busy/idle and per-stage token flow. AFD gets
-  # both the attention and FFN profiler envs; baseline uses vLLM's built-in
-  # torch profiler (VLLM_TORCH_PROFILER_DIR).
-  local prof_env=""
+  # PROFILE registers vLLM's request-controlled profiler. CORRELATION can be
+  # enabled independently and records sidecars for the full server lifetime.
+  local baseline_prof_env="" attn_prof_env="" ffn_prof_env=""
   if [ "$PROFILE" = "1" ]; then
+    baseline_prof_env="VLLM_TORCH_PROFILER_DIR=$PROFILE_DIR/baseline"
     if [ "$system_label" = "afd" ]; then
-      prof_env="AFD_NPU_ATTENTION_PROFILER_ENABLE=1 AFD_NPU_ATTENTION_PROFILER_WAIT=$PROF_WAIT \
-AFD_NPU_ATTENTION_PROFILER_WARMUP=$PROF_WARMUP AFD_NPU_ATTENTION_PROFILER_ACTIVE=$PROF_ACTIVE \
-AFD_NPU_ATTENTION_PROFILER_SKIP_FIRST=$PROF_SKIP_FIRST AFD_NPU_ATTENTION_PROFILER_DIR=$PROFILE_DIR \
-AFD_NPU_FFN_PROFILER_ENABLE=1 AFD_NPU_FFN_PROFILER_WAIT=$PROF_WAIT \
-AFD_NPU_FFN_PROFILER_WARMUP=$PROF_WARMUP AFD_NPU_FFN_PROFILER_ACTIVE=$PROF_ACTIVE \
-AFD_NPU_FFN_PROFILER_SKIP_FIRST=$PROF_SKIP_FIRST AFD_NPU_FFN_PROFILER_DIR=$PROFILE_DIR \
-AFD_ASYNC_MOE_LAYOUT_LOG=1 AFD_CAM_OP_IO_LOG=1"
-    else
-      prof_env="VLLM_TORCH_PROFILER_DIR=$PROFILE_DIR"
+      attn_prof_env="VLLM_TORCH_PROFILER_DIR=$PROFILE_DIR/attention AFD_ASYNC_MOE_LAYOUT_LOG=1 AFD_CAM_OP_IO_LOG=1"
+      ffn_prof_env="VLLM_TORCH_PROFILER_DIR=$PROFILE_DIR/ffn AFD_ASYNC_MOE_LAYOUT_LOG=1 AFD_CAM_OP_IO_LOG=1"
     fi
+  fi
+  if [ "$system_label" = "afd" ] && { [ "$PROFILE" = "1" ] || [ "$CORRELATION" = "1" ]; }; then
+    local trace_session_id="${label}_$(date +%s%N)"
+    local correlation_env="AFD_TRACE_ENABLE=1 AFD_TRACE_SESSION_ID=$trace_session_id AFD_TRACE_DIR=$PROFILE_DIR/correlation"
+    attn_prof_env="$attn_prof_env $correlation_env"
+    ffn_prof_env="$ffn_prof_env $correlation_env"
   fi
   if [ "$system_label" = "baseline" ]; then
     itask exec "$NODE1" --tty=false -- bash -c "
       cd $REPO && mkdir -p $LOG_DIR
       export PROMETHEUS_MULTIPROC_DIR=$PROM_DIR; mkdir -p \$PROMETHEUS_MULTIPROC_DIR
-      setsid env PYTHONUNBUFFERED=1 $prof_env MAX_NUM_BATCHED_TOKENS=$bt DP_START_RANK=2 VLLM_ENABLE_PREFIX_CACHING=$pc DP_ADDRESS=$NODE0_IP \
+      setsid env PYTHONUNBUFFERED=1 $baseline_prof_env MAX_NUM_BATCHED_TOKENS=$bt DP_START_RANK=2 VLLM_ENABLE_PREFIX_CACHING=$pc DP_ADDRESS=$NODE0_IP \
         bash tools/benchmarks/prefill_launch_baseline_dp4tp8.sh \
         > $LOG_DIR/${label}_node1.log 2>&1 < /dev/null &
     " 2>/dev/null || true
@@ -205,7 +200,7 @@ AFD_ASYNC_MOE_LAYOUT_LOG=1 AFD_CAM_OP_IO_LOG=1"
     itask exec "$NODE0" --tty=false -- bash -c "
       cd $REPO && mkdir -p $LOG_DIR
       export PROMETHEUS_MULTIPROC_DIR=$PROM_DIR; mkdir -p \$PROMETHEUS_MULTIPROC_DIR
-      setsid env PYTHONUNBUFFERED=1 $prof_env MAX_NUM_BATCHED_TOKENS=$bt DP_START_RANK=0 VLLM_ENABLE_PREFIX_CACHING=$pc DP_ADDRESS=$NODE0_IP \
+      setsid env PYTHONUNBUFFERED=1 $baseline_prof_env MAX_NUM_BATCHED_TOKENS=$bt DP_START_RANK=0 VLLM_ENABLE_PREFIX_CACHING=$pc DP_ADDRESS=$NODE0_IP \
         bash tools/benchmarks/prefill_launch_baseline_dp4tp8.sh \
         > $LOG_DIR/${label}_node0.log 2>&1 < /dev/null &
     " 2>/dev/null || true
@@ -214,7 +209,7 @@ AFD_ASYNC_MOE_LAYOUT_LOG=1 AFD_CAM_OP_IO_LOG=1"
     itask exec "$NODE0" --tty=false -- bash -c "
       cd $REPO && mkdir -p $LOG_DIR
       export PROMETHEUS_MULTIPROC_DIR=$PROM_DIR; mkdir -p \$PROMETHEUS_MULTIPROC_DIR
-      setsid env PYTHONUNBUFFERED=1 $prof_env $varg MAX_NUM_BATCHED_TOKENS=$bt DP_START_RANK=0 VLLM_ENABLE_PREFIX_CACHING=$pc DP_ADDRESS=$NODE0_IP AFD_HOST=$NODE0_IP \
+      setsid env PYTHONUNBUFFERED=1 $attn_prof_env $varg MAX_NUM_BATCHED_TOKENS=$bt DP_START_RANK=0 VLLM_ENABLE_PREFIX_CACHING=$pc DP_ADDRESS=$NODE0_IP AFD_HOST=$NODE0_IP \
         bash tools/benchmarks/prefill_launch_afd_attention.sh \
         > $LOG_DIR/${label}_node0.log 2>&1 < /dev/null &
     " 2>/dev/null || true
@@ -222,11 +217,11 @@ AFD_ASYNC_MOE_LAYOUT_LOG=1 AFD_CAM_OP_IO_LOG=1"
     itask exec "$NODE1" --tty=false -- bash -c "
       cd $REPO && mkdir -p $LOG_DIR
       export PROMETHEUS_MULTIPROC_DIR=$PROM_DIR; mkdir -p \$PROMETHEUS_MULTIPROC_DIR
-      setsid env PYTHONUNBUFFERED=1 $prof_env $varg MAX_NUM_BATCHED_TOKENS=$bt DP_START_RANK=2 ATTN_DEVICES=0,1,2,3,4,5,6,7 VLLM_ENABLE_PREFIX_CACHING=$pc DP_ADDRESS=$NODE0_IP AFD_HOST=$NODE0_IP \
+      setsid env PYTHONUNBUFFERED=1 $attn_prof_env $varg MAX_NUM_BATCHED_TOKENS=$bt DP_START_RANK=2 ATTN_DEVICES=0,1,2,3,4,5,6,7 VLLM_ENABLE_PREFIX_CACHING=$pc DP_ADDRESS=$NODE0_IP AFD_HOST=$NODE0_IP \
         bash tools/benchmarks/prefill_launch_afd_attention.sh \
         > $LOG_DIR/${label}_node1_attn.log 2>&1 < /dev/null &
       sleep 3
-      setsid env PYTHONUNBUFFERED=1 $prof_env $varg MAX_NUM_BATCHED_TOKENS=$bt VLLM_ENABLE_PREFIX_CACHING=$pc DP_ADDRESS=$NODE0_IP AFD_HOST=$NODE0_IP \
+      setsid env PYTHONUNBUFFERED=1 $ffn_prof_env $varg MAX_NUM_BATCHED_TOKENS=$bt VLLM_ENABLE_PREFIX_CACHING=$pc DP_ADDRESS=$NODE0_IP AFD_HOST=$NODE0_IP \
         bash tools/benchmarks/prefill_launch_afd_ffn.sh \
         > $LOG_DIR/${label}_node1_ffn.log 2>&1 < /dev/null &
     " 2>/dev/null || true
@@ -293,6 +288,37 @@ run_benchmark() {
   return $rc
 }
 
+profile_request() {
+  local node=$1 port=$2 action=$3
+  itask_exec_retry "$node" \
+    "curl --fail --silent --show-error --max-time 1800 -X POST http://127.0.0.1:$port/${action}_profile"
+}
+
+start_profile_window() {
+  local system_label=$1
+  if [ "$system_label" = "baseline" ]; then
+    profile_request "$NODE0" 8000 start
+    return
+  fi
+  if ! profile_request "$NODE1" 8001 start ||
+     ! profile_request "$NODE0" 8000 start; then
+    profile_request "$NODE0" 8000 stop || true
+    profile_request "$NODE1" 8001 stop || true
+    return 1
+  fi
+}
+
+stop_profile_window() {
+  local system_label=$1 rc=0
+  if [ "$system_label" = "baseline" ]; then
+    profile_request "$NODE0" 8000 stop
+    return
+  fi
+  profile_request "$NODE0" 8000 stop || rc=1
+  profile_request "$NODE1" 8001 stop || rc=1
+  return $rc
+}
+
 # run_group <config> <label>
 run_group() {
   local config=$1 label=$2
@@ -304,10 +330,14 @@ run_group() {
   variant=$(cfg_stage2 "$config" variant)
   local pc=0; [ "$prefix_ratio" != "0" ] && pc=1
 
-  # Stage-3 PROFILE mode: trace + telemetry live under the run's result dir.
-  if [ "$PROFILE" = "1" ]; then
+  # Profiler and correlation artifacts live under the run's result dir.
+  if [ "$PROFILE" = "1" ] || [ "$CORRELATION" = "1" ]; then
     PROFILE_DIR="$REPO/$rd/traces"
-    echo "[PROFILE] trace dir $PROFILE_DIR (wait=$PROF_WAIT warmup=$PROF_WARMUP active=$PROF_ACTIVE skip_first=$PROF_SKIP_FIRST)"
+  fi
+  if [ "$PROFILE" = "1" ]; then
+    echo "[PROFILE] request-controlled traces under $PROFILE_DIR"
+  elif [ "$CORRELATION" = "1" ]; then
+    echo "[CORRELATION] sidecars under $PROFILE_DIR/correlation"
   fi
 
   if [ "$RESUME" = true ] && cell_complete "$sys_name" "$bt" "$rps" "$prefix_ratio" "$rd"; then
@@ -322,6 +352,9 @@ run_group() {
 
   # Server lifecycle: reuse when the key matches the previous group.
   local key="$system_label|$bt|$prefix_ratio|$variant|$cache_state"
+  if [ "$PROFILE" = "1" ] || [ "$CORRELATION" = "1" ]; then
+    key="$key|$label"
+  fi
   if [ "$key" = "$PREV_KEY" ]; then
     echo "[REUSE] same group key — reset cache between cells"
     if ! reset_prefix_cache; then
@@ -366,12 +399,25 @@ run_group() {
         }
       fi
     fi
-    run_benchmark "$config" "$sys_name" "$bt" "$prefix_ratio" "$repeat" || {
+    if [ "$PROFILE" = "1" ] && ! start_profile_window "$system_label"; then
+      echo "[FAIL] profiler start for repeat $repeat"
+      kill_all
+      PREV_KEY=""
+      return 1
+    fi
+    if ! run_benchmark "$config" "$sys_name" "$bt" "$prefix_ratio" "$repeat"; then
+      [ "$PROFILE" = "1" ] && stop_profile_window "$system_label" || true
       echo "[FAIL] benchmark repeat $repeat"
       kill_all
       PREV_KEY=""
       return 1
-    }
+    fi
+    if [ "$PROFILE" = "1" ] && ! stop_profile_window "$system_label"; then
+      echo "[FAIL] profiler stop for repeat $repeat"
+      kill_all
+      PREV_KEY=""
+      return 1
+    fi
   done
 
   if [ "$PROFILE" = "1" ]; then

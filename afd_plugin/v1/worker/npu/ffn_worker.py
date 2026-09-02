@@ -73,6 +73,20 @@ class AFDNPUFFNWorker(NPUWorker):
         )
         self.model_runner = AFDNPUFFNModelRunner(self.vllm_config, self.device)
 
+    # Override reason: connector-driven FFN compute bypasses NPUWorker's
+    # execute_model profiler step and needs AFD's Level2/MSTX profiler.
+    # Behavior: route the native vLLM profile RPC to the AFD FFN runner.
+    # Signature matches the pinned NPUWorker.profile; no parameters are added.
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+    ) -> None:
+        if is_start:
+            self.model_runner.start_profile(profile_prefix, self.rank)
+        else:
+            self.model_runner.stop_profile()
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return {}
 

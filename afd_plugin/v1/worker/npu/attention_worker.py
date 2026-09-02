@@ -62,5 +62,19 @@ class AFDNPUAttentionWorker(NPUWorker):
             self.device,
         )
 
+    # Override reason: vLLM-Ascend's worker profiler uses Level1 and does not
+    # retain the Level2/MSTX settings required by AFD correlation traces.
+    # Behavior: route the native vLLM profile RPC to the AFD Attention runner.
+    # Signature matches the pinned NPUWorker.profile; no parameters are added.
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+    ) -> None:
+        if is_start:
+            self.model_runner.start_profile(profile_prefix, self.rank)
+        else:
+            self.model_runner.stop_profile()
+
 
 __all__ = ["AFDNPUAttentionWorker"]
