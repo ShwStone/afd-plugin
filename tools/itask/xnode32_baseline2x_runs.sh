@@ -19,7 +19,8 @@ ROUTER=$CODE/tools/benchmarks/least_load_router.py
 PY=/usr/local/python3.12.13/bin/python3
 WL=$CODE/tools/datasets/moonconv-wildchat-v4-flash-prefill/workloads
 NASDIR=/a3_inference/itask/workdir/tq02357756/shwstone/xnode32_baseline2x
-TAG=base2x_mbt8192
+MBT=${MBT:-8192}
+TAG=base2x_mbt${MBT}
 ROUTER_PORT=8800
 
 X="timeout --signal=KILL 120 itask exec"
@@ -28,7 +29,7 @@ say() { echo "[$(date +%H:%M:%S)] $*"; }
 
 # "cws" is a named preset resolved inside v4_launch_baseline.sh; raw JSON would
 # be mangled by brace expansion across the nested bash -c quoting layers.
-BENV="DP_SIZE=4 TP_SIZE=4 MAX_NUM_BATCHED_TOKENS=8192 PORT=8000 ADDITIONAL_CONFIG=cws"
+BENV="DP_SIZE=4 TP_SIZE=4 MAX_NUM_BATCHED_TOKENS=$MBT PORT=8000 ADDITIONAL_CONFIG=cws"
 
 say "== preflight: cleanup script + plans + launcher =="
 for P in "$MASTER" "$SECOND"; do
@@ -78,6 +79,10 @@ for P in "$MASTER" "$SECOND"; do
 done
 
 say "== start router on master :$ROUTER_PORT =="
+# Kill any leftover router first. Bracket pattern avoids pkill self-match; this
+# must stay a SEPARATE exec call from the start below (the start command line
+# contains the literal router path and would be matched).
+$S "$MASTER" -- bash -c 'pkill -f "[l]east_load_router"; sleep 1; echo killed' 2>&1 | tr -d '\r' | tail -1
 $S "$MASTER" -- bash -c "setsid bash -c 'nohup $PY $ROUTER --port $ROUTER_PORT --backend http://$NODE1_IP:8000 --backend http://$NODE2_IP:8000 --poll-interval 0.5 --log-file /tmp/${TAG}_router_decisions.jsonl > /tmp/${TAG}_router.log 2>&1 &' ; echo started" 2>&1 | tr -d '\r' | tail -1
 sleep 3
 $S "$MASTER" -- bash -c "curl -s -m 5 http://127.0.0.1:$ROUTER_PORT/healthz" 2>&1 | tr -d '\r' | tail -1
