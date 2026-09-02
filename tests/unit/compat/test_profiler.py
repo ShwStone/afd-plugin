@@ -1,115 +1,142 @@
 from __future__ import annotations
 
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
 
+from afd_plugin.compat import profiler as profiler_module_under_test
 from afd_plugin.compat.profiler import (
-    afd_gpu_profiler_config,
     create_afd_gpu_profiler,
+    start_afd_gpu_profiler,
     step_afd_gpu_profiler,
     stop_afd_gpu_profiler,
 )
 
-_ENV_NAMES = (
-    "AFD_GPU_ATTENTION_PROFILER_ENABLE",
-    "AFD_GPU_ATTENTION_PROFILER_WAIT",
-    "AFD_GPU_ATTENTION_PROFILER_WARMUP",
-    "AFD_GPU_ATTENTION_PROFILER_ACTIVE",
-    "AFD_GPU_ATTENTION_PROFILER_REPEAT",
-    "AFD_GPU_ATTENTION_PROFILER_SKIP_FIRST",
-    "AFD_GPU_ATTENTION_PROFILER_DIR",
-    "AFD_GPU_FFN_PROFILER_ENABLE",
-    "AFD_GPU_FFN_PROFILER_WAIT",
-    "AFD_GPU_FFN_PROFILER_WARMUP",
-    "AFD_GPU_FFN_PROFILER_ACTIVE",
-    "AFD_GPU_FFN_PROFILER_REPEAT",
-    "AFD_GPU_FFN_PROFILER_SKIP_FIRST",
-    "AFD_GPU_FFN_PROFILER_DIR",
-    "VLLM_TORCH_PROFILER_DIR",
-)
+
+def test_gpu_profiler_is_disabled_without_vllm_config():
+    assert create_afd_gpu_profiler("attention", None) is None
+    assert (
+        create_afd_gpu_profiler(
+            "attention",
+            SimpleNamespace(profiler=None),
+        )
+        is None
+    )
 
 
-@pytest.fixture(autouse=True)
-def _clear_profiler_env(monkeypatch):
-    for name in _ENV_NAMES:
-        monkeypatch.delenv(name, raising=False)
+def test_gpu_profiler_requires_torch_config():
+    with pytest.raises(ValueError, match="profiler=torch"):
+        create_afd_gpu_profiler(
+            "attention",
+            SimpleNamespace(profiler="cuda"),
+        )
 
 
-def test_gpu_profiler_defaults_are_disabled():
-    attention = afd_gpu_profiler_config("attention")
-    ffn = afd_gpu_profiler_config("ffn")
+def test_gpu_profiler_rejects_iteration_schedules():
+    config = _request_profiler_config()
+    config.max_iterations = 10
 
-    assert attention.enabled is False
-    assert attention.wait == 2500
-    assert attention.warmup == 1
-    assert attention.active == 10
-    assert attention.repeat == 1
-    assert attention.skip_first == 0
-    assert attention.trace_dir == "./profiler_logs/attn"
-    assert ffn.enabled is False
-    assert ffn.trace_dir == "./profiler_logs/ffn"
+    with pytest.raises(ValueError, match="does not support iteration schedules"):
+        create_afd_gpu_profiler("attention", config)
 
 
-def test_gpu_profiler_dir_falls_back_to_vllm_torch_profiler_dir(monkeypatch):
-    monkeypatch.setenv("VLLM_TORCH_PROFILER_DIR", "/tmp/vllm-profile")
+def test_gpu_profiler_is_lazy_idempotent_and_repeatable(monkeypatch):
+    profiler_module = _install_fake_torch(monkeypatch)
+    config = _request_profiler_config()
 
-    assert afd_gpu_profiler_config("attention").trace_dir == "/tmp/vllm-profile"
+    controller = create_afd_gpu_profiler("attention", config)
 
-    monkeypatch.setenv("AFD_GPU_ATTENTION_PROFILER_DIR", "/tmp/afd-attn")
+    assert controller is not None
+    assert profiler_module.created_profilers == []
 
-    assert afd_gpu_profiler_config("attention").trace_dir == "/tmp/afd-attn"
+    start_afd_gpu_profiler(controller, profile_prefix="request", global_rank=3)
+    step_afd_gpu_profiler(controller)
+    start_afd_gpu_profiler(controller, profile_prefix="ignored", global_rank=3)
+
+    first = profiler_module.created_profilers[0]
+    assert first.started is True
+    assert first.steps == 1
+    assert len(profiler_module.created_profilers) == 1
+    assert profiler_module.worker_names == ["request-attention-rank3-run0"]
+    assert "schedule" not in profiler_module.profile_kwargs[0]
+
+    stop_afd_gpu_profiler(controller)
+    stop_afd_gpu_profiler(controller)
+    start_afd_gpu_profiler(controller, profile_prefix="request", global_rank=3)
+
+    assert first.stopped is True
+    assert len(profiler_module.created_profilers) == 2
+    assert profiler_module.worker_names[-1] == "request-attention-rank3-run1"
 
 
-def test_create_gpu_profiler_uses_configured_schedule(monkeypatch):
+def test_concurrent_gpu_profiler_stops_release_once(monkeypatch):
+    profiler_module = _install_fake_torch(monkeypatch)
+    controller = create_afd_gpu_profiler("attention", _request_profiler_config())
+    start_afd_gpu_profiler(controller, profile_prefix=None, global_rank=0)
+
+    threads = [
+        threading.Thread(target=stop_afd_gpu_profiler, args=(controller,))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert profiler_module.created_profilers[0].stop_calls == 1
+
+
+def test_failed_gpu_profiler_stop_still_allows_restart(monkeypatch):
+    profiler_module = _install_fake_torch(monkeypatch)
+    controller = create_afd_gpu_profiler("attention", _request_profiler_config())
+    start_afd_gpu_profiler(controller, profile_prefix=None, global_rank=0)
+    profiler_module.created_profilers[0].stop_error = RuntimeError("flush failed")
+
+    with pytest.raises(RuntimeError, match="flush failed"):
+        stop_afd_gpu_profiler(controller)
+    start_afd_gpu_profiler(controller, profile_prefix=None, global_rank=0)
+
+    assert len(profiler_module.created_profilers) == 2
+
+
+def test_start_gpu_profiler_requires_configuration():
+    with pytest.raises(RuntimeError, match="not enabled"):
+        start_afd_gpu_profiler(None, profile_prefix=None, global_rank=0)
+
+
+def _install_fake_torch(monkeypatch) -> _FakeTorchProfiler:
     profiler_module = _FakeTorchProfiler()
     monkeypatch.setitem(
         sys.modules,
         "torch",
         SimpleNamespace(profiler=profiler_module),
     )
-    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_ENABLE", "true")
-    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_WAIT", "3")
-    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_WARMUP", "4")
-    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_ACTIVE", "5")
-    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_REPEAT", "6")
-    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_SKIP_FIRST", "7")
-    monkeypatch.setenv("AFD_GPU_FFN_PROFILER_DIR", "/tmp/afd-ffn")
-
-    profiler = create_afd_gpu_profiler("ffn")
-
-    assert profiler is profiler_module.created_profiler
-    assert profiler.started is True
-    assert profiler_module.schedule_kwargs == {
-        "wait": 3,
-        "warmup": 4,
-        "active": 5,
-        "repeat": 6,
-        "skip_first": 7,
-    }
-    assert profiler_module.profile_kwargs["record_shapes"] is True
-    assert profiler_module.profile_kwargs["profile_memory"] is False
-    assert profiler_module.profile_kwargs["with_stack"] is False
-    assert profiler_module.trace_dir == "/tmp/afd-ffn"
+    monkeypatch.setattr(
+        profiler_module_under_test,
+        "_trace_name",
+        lambda role, *, profile_prefix, global_rank, run_index: (
+            f"{profile_prefix or 'afd'}-{role}-rank{global_rank}-run{run_index}"
+        ),
+    )
+    return profiler_module
 
 
-def test_step_gpu_profiler_ignores_disabled_profiler():
-    step_afd_gpu_profiler(None)
-
-    profiler = _StepProfiler()
-    step_afd_gpu_profiler(profiler)
-
-    assert profiler.steps == 1
-
-
-def test_stop_gpu_profiler_ignores_disabled_profiler():
-    stop_afd_gpu_profiler(None)
-
-    profiler = _StepProfiler()
-    stop_afd_gpu_profiler(profiler)
-
-    assert profiler.stopped is True
+def _request_profiler_config():
+    return SimpleNamespace(
+        profiler="torch",
+        torch_profiler_dir="/tmp/request-profile",
+        torch_profiler_record_shapes=True,
+        torch_profiler_with_memory=False,
+        torch_profiler_with_stack=False,
+        torch_profiler_with_flops=False,
+        torch_profiler_use_gzip=False,
+        delay_iterations=0,
+        max_iterations=0,
+        warmup_iterations=0,
+        wait_iterations=0,
+    )
 
 
 class _StepProfiler:
@@ -117,11 +144,16 @@ class _StepProfiler:
         self.steps = 0
         self.started = False
         self.stopped = False
+        self.stop_calls = 0
+        self.stop_error = None
 
     def start(self):
         self.started = True
 
     def stop(self):
+        self.stop_calls += 1
+        if self.stop_error is not None:
+            raise self.stop_error
         self.stopped = True
 
     def step(self):
@@ -134,19 +166,23 @@ class _FakeTorchProfiler:
         CUDA = "cuda"
 
     def __init__(self):
-        self.created_profiler = _StepProfiler()
-        self.schedule_kwargs = None
-        self.profile_kwargs = None
-        self.trace_dir = None
+        self.created_profilers = []
+        self.profile_kwargs = []
+        self.worker_names = []
 
-    def schedule(self, **kwargs):
-        self.schedule_kwargs = kwargs
-        return kwargs
-
-    def tensorboard_trace_handler(self, trace_dir):
-        self.trace_dir = trace_dir
-        return ("handler", trace_dir)
+    def tensorboard_trace_handler(
+        self,
+        trace_dir,
+        *,
+        worker_name=None,
+        use_gzip=False,
+    ):
+        if worker_name is not None:
+            self.worker_names.append(worker_name)
+        return ("handler", trace_dir, worker_name, use_gzip)
 
     def profile(self, **kwargs):
-        self.profile_kwargs = kwargs
-        return self.created_profiler
+        self.profile_kwargs.append(kwargs)
+        profiler = _StepProfiler()
+        self.created_profilers.append(profiler)
+        return profiler

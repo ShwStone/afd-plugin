@@ -81,8 +81,9 @@ baseline（同步 DP4TP8 EP32）没有这个机制：更大 batch → 整批同�
 ### P2 归因 replay（L2 profiler + npu-smi + env 日志，未开始）
 - 选中 cell：`rps6 × mbt ∈ {8192, 32768, 131072} × {baseline, AFD}` = 6 个 L2 replay
   （+ rps8 mbt32768 AFD 1 个，展示饱和边界）= **7 profile cells**
-- 每 replay：torch_npu profiler（AFD：`AFD_NPU_ATTENTION_PROFILER_ENABLE=1` + `AFD_NPU_FFN_PROFILER_ENABLE=1`；
-  baseline：`VLLM_TORCH_PROFILER_DIR`）+ npu-smi 连续采样（node0+node1）+ AFD `AFD_ASYNC_MOE_LAYOUT_LOG=1`
+- 每 replay：torch_npu profiler（AFD：Attention/FFN 服务分别通过 `--profiler-config` 注册控制端点，并按
+  FFN start → Attention start → replay → Attention stop → FFN stop 调用；baseline：`VLLM_TORCH_PROFILER_DIR`）
+  + npu-smi 连续采样（node0+node1）+ AFD `AFD_ASYNC_MOE_LAYOUT_LOG=1`
   与 `AFD_CAM_OP_IO_LOG=1`
 - 产出：每 rank busy-ratio、attention/FFN idle bubble、dispatch/combine 时间、comm/compute overlap、
   每 NPU AICore% 占用、stage token 不平衡 → 归因表
@@ -160,8 +161,8 @@ nohup env NODE0=afd-exp-2 NODE1=afd-s2-2 NODE0_IP=33.215.117.99 PHASE=btsweep-pr
   stdbuf -oL -eL bash tools/benchmarks/run_stage2_l0.sh --resume \
   > bench_results/prefill_stage3/stage3_btsweep_profile.log 2>&1 &
 ```
-> 注意：profiler 窗口默认 WAIT=0/WARMUP=1/ACTIVE=30/SKIP_FIRST=20，若 trace 落在 drain 后需校准
-> （`PROF_WAIT/PROF_WARMUP/PROF_ACTIVE/PROF_SKIP_FIRST` env）。跨节点时间对齐是 best-effort。
+> profiler 由脚本对每个 replay 显式调用 `/start_profile`、`/stop_profile`，不再使用固定 step 窗口。
+> 精确跨节点合并前，必须用 `afd_trace_clock_sync.py` 为同一 session 采集四时间戳校准文件。
 
 ### S3 分析 + 渲染
 ```bash

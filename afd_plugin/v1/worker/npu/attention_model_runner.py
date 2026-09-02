@@ -69,6 +69,7 @@ from afd_plugin.compat.npu import (
 )
 from afd_plugin.compat.npu.profiler import (
     create_afd_npu_profiler,
+    start_afd_npu_profiler,
     step_afd_npu_profiler,
     stop_afd_npu_profiler,
 )
@@ -160,11 +161,28 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
         self._afd_async_moe_ubatch_metadata = None
         self._afd_live_execution = False
         self.ubatch_slices = None
-        self.prof = create_afd_npu_profiler("attention")
+        self.prof = create_afd_npu_profiler(
+            "attention",
+            vllm_config.profiler_config,
+        )
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")
+
+    def start_profile(
+        self,
+        profile_prefix: str | None,
+        global_rank: int,
+    ) -> None:
+        start_afd_npu_profiler(
+            self.prof,
+            profile_prefix=profile_prefix,
+            global_rank=global_rank,
+        )
+
+    def stop_profile(self) -> None:
+        stop_afd_npu_profiler(self.prof)
 
     # Patch reason: vLLM-Ascend calls the execution/padding hook without opting
     # into microbatching, and AFD must keep that hook's upstream default intact.

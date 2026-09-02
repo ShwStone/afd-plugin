@@ -21,6 +21,7 @@ from vllm.v1.worker.workspace import reset_workspace_manager
 
 from afd_plugin.compat.profiler import (
     create_afd_gpu_profiler,
+    start_afd_gpu_profiler,
     step_afd_gpu_profiler,
     stop_afd_gpu_profiler,
 )
@@ -93,11 +94,28 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         )
         self._cuda_graphs: dict[tuple, dict[str, Any]] = {}
         self._graph_memory_pool: Any | None = None
-        self.prof = create_afd_gpu_profiler("ffn")
+        self.prof = create_afd_gpu_profiler(
+            "ffn",
+            vllm_config.profiler_config,
+        )
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="ffn")
+
+    def start_profile(
+        self,
+        profile_prefix: str | None,
+        global_rank: int,
+    ) -> None:
+        start_afd_gpu_profiler(
+            self.prof,
+            profile_prefix=profile_prefix,
+            global_rank=global_rank,
+        )
+
+    def stop_profile(self) -> None:
+        stop_afd_gpu_profiler(self.prof)
 
     def get_model(self) -> Any:
         return self.model

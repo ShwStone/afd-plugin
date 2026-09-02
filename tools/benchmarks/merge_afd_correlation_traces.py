@@ -21,23 +21,29 @@ from pathlib import Path
 from typing import Final
 
 if __package__:
-    from .link_afd_device_flows import build_device_flows
+    from .link_afd_device_flows import CORRELATION_PID_ARG, build_device_flows
 else:
-    from link_afd_device_flows import build_device_flows
+    from link_afd_device_flows import CORRELATION_PID_ARG, build_device_flows
 
 NANOSECONDS_PER_MICROSECOND: Final[int] = 1_000
 TRACE_SCHEMA_VERSION: Final[int] = 1
 FLOW_MARKER_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?P<event>afd\.[^ ]+)(?: flow_id=(?P<flow_id>[0-9a-f]+))?$",
 )
-REQUIRED_FLOW_EVENTS: Final[frozenset[str]] = frozenset(
-    {
-        "afd.cam.dispatch_send",
-        "afd.cam.dispatch_recv",
-        "afd.ffn.compute",
-        "afd.cam.combine_send",
-        "afd.cam.combine_recv",
-    },
+ROLE_FLOW_EVENTS: Final[dict[str, frozenset[str]]] = {
+    "attention": frozenset(
+        {"afd.cam.dispatch_send", "afd.cam.combine_recv"},
+    ),
+    "ffn": frozenset(
+        {
+            "afd.cam.dispatch_recv",
+            "afd.ffn.compute",
+            "afd.cam.combine_send",
+        },
+    ),
+}
+REQUIRED_FLOW_EVENTS: Final[frozenset[str]] = frozenset().union(
+    *ROLE_FLOW_EVENTS.values(),
 )
 
 
@@ -64,6 +70,7 @@ class Sidecar:
     events: list[dict[str, object]]
     transform: ClockTransform | None = None
     pid: int = 0
+    summary: dict[str, object] | None = None
 
     @property
     def identity(self) -> dict[str, object]:
@@ -81,9 +88,18 @@ def load_sidecar(path: Path) -> Sidecar:
     metadata: dict[str, object] | None = None
     anchors: list[dict[str, object]] = []
     events: list[dict[str, object]] = []
+    summary: dict[str, object] | None = None
+    unfinished = path.name.endswith(".jsonl.tmp")
     with path.open("r", encoding="utf-8") as input_file:
         for line_number, line in enumerate(input_file, start=1):
-            payload = json.loads(line)
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                if unfinished and not input_file.read().strip():
+                    break
+                raise ValueError(
+                    f"{path}:{line_number}: invalid JSON record",
+                ) from None
             if not isinstance(payload, dict):
                 raise ValueError(f"{path}:{line_number}: expected a JSON object")
             record_type = payload.get("record_type")
@@ -95,15 +111,28 @@ def load_sidecar(path: Path) -> Sidecar:
                 anchors.append(payload)
             elif record_type == "event":
                 events.append(payload)
+            elif record_type == "summary":
+                if summary is not None:
+                    raise ValueError(f"{path}: contains multiple summary records")
+                summary = payload
             else:
                 raise ValueError(
                     f"{path}:{line_number}: unknown record_type {record_type!r}",
                 )
     if metadata is None:
         raise ValueError(f"{path}: missing metadata record")
+    schema_version = int(metadata.get("schema_version", 1))
+    if schema_version not in {1, 2}:
+        raise ValueError(f"{path}: unsupported schema version {schema_version}")
     if not anchors:
         raise ValueError(f"{path}: missing clock anchors")
-    return Sidecar(path=path, metadata=metadata, anchors=anchors, events=events)
+    return Sidecar(
+        path=path,
+        metadata=metadata,
+        anchors=anchors,
+        events=events,
+        summary=summary,
+    )
 
 
 def load_clock_sync(path: Path) -> dict[str, object]:
@@ -112,6 +141,8 @@ def load_clock_sync(path: Path) -> dict[str, object]:
         raise ValueError(f"{path}: clock-sync document must be an object")
     if payload.get("record_type") != "clock_sync_client":
         raise ValueError(f"{path}: expected a clock_sync_client document")
+    if int(payload.get("schema_version", 1)) != 1:
+        raise ValueError(f"{path}: unsupported clock-sync schema version")
     return payload
 
 
@@ -142,6 +173,34 @@ def best_clock_sample(payload: dict[str, object]) -> tuple[int, int]:
     return offset_ns, (round_trip_ns + 1) // 2
 
 
+def validate_clock_sync_coverage(
+    sidecars: Iterable[Sidecar],
+    clock_syncs: Iterable[dict[str, object]],
+) -> None:
+    """Require one reference and one calibration per other sidecar host."""
+
+    hosts = {sidecar.hostname for sidecar in sidecars}
+    if len(hosts) <= 1:
+        return
+    clock_syncs = list(clock_syncs)
+    reference_hosts = {str(clock_sync["reference_host"]) for clock_sync in clock_syncs}
+    if len(reference_hosts) != 1:
+        raise ValueError(
+            "cross-host merging requires clock-sync files with one reference host",
+        )
+    reference_host = next(iter(reference_hosts))
+    if reference_host not in hosts:
+        raise ValueError(
+            f"clock-sync reference host {reference_host!r} has no sidecar",
+        )
+    calibrated_hosts = {str(clock_sync["client_host"]) for clock_sync in clock_syncs}
+    missing_hosts = hosts - {reference_host} - calibrated_hosts
+    if missing_hosts:
+        raise ValueError(
+            f"missing clock-sync files for hosts: {sorted(missing_hosts)}",
+        )
+
+
 def assign_clock_transforms(
     sidecars: list[Sidecar],
     clock_syncs: Iterable[dict[str, object]],
@@ -153,26 +212,46 @@ def assign_clock_transforms(
         reference_anchors.setdefault(sidecar.hostname, sidecar.anchors[0])
 
     sync_by_client: dict[str, dict[str, object]] = {}
+    reference_hosts: set[str] = set()
     for clock_sync in clock_syncs:
-        sync_by_client[str(clock_sync["client_host"])] = clock_sync
+        client_host = str(clock_sync["client_host"])
+        if client_host in sync_by_client:
+            raise ValueError(f"multiple clock-sync files for host {client_host!r}")
+        sync_by_client[client_host] = clock_sync
+        reference_hosts.add(str(clock_sync["reference_host"]))
+    if len(reference_hosts) > 1:
+        raise ValueError(
+            f"clock-sync files use multiple reference hosts: {reference_hosts}",
+        )
 
     diagnostics: list[dict[str, object]] = []
     for sidecar in sidecars:
         local_anchor = sidecar.anchors[0]
         sync = sync_by_client.get(sidecar.hostname)
         if sync is None:
+            is_reference = sidecar.hostname in reference_hosts
             sidecar.transform = ClockTransform(
                 source_mono_ns=int(local_anchor["monotonic_ns"]),
                 target_realtime_ns=int(local_anchor["realtime_ns"]),
-                method="local_realtime_anchor",
-                uncertainty_ns=None,
+                method=(
+                    "clock_sync_reference_anchor"
+                    if is_reference
+                    else "local_realtime_anchor"
+                ),
+                uncertainty_ns=int(
+                    local_anchor.get("capture_uncertainty_ns", 0),
+                ),
             )
             diagnostics.append(
                 _clock_diagnostic(
                     sidecar,
                     note=(
-                        "No cross-host calibration; alignment depends on host "
-                        "realtime clock synchronization"
+                        None
+                        if is_reference or len(reference_anchors) == 1
+                        else (
+                            "No cross-host calibration; alignment depends on host "
+                            "realtime clock synchronization"
+                        )
                     ),
                 ),
             )
@@ -241,6 +320,7 @@ def build_merged_trace(
     origin_ns = min(all_global_times)
 
     trace_events: list[dict[str, object]] = []
+    incomplete_ranges: list[dict[str, object]] = []
     flow_events: dict[str, list[tuple[Sidecar, dict[str, object], int]]] = defaultdict(
         list
     )
@@ -248,10 +328,19 @@ def build_merged_trace(
         sidecar.pid = process_index
         trace_events.extend(_process_metadata_events(sidecar))
         trace_events.extend(
-            _sidecar_trace_events(sidecar, origin_ns, flow_events),
+            _sidecar_trace_events(
+                sidecar,
+                origin_ns,
+                flow_events,
+                incomplete_ranges,
+            ),
         )
 
-    flow_trace_events, flow_report = _build_flow_events(flow_events, origin_ns)
+    flow_trace_events, flow_report = _build_flow_events(
+        flow_events,
+        origin_ns,
+        sidecars,
+    )
     trace_events.extend(flow_trace_events)
 
     sidecar_by_path = {
@@ -278,9 +367,7 @@ def build_merged_trace(
             {"profiler_trace": str(profiler_path), **diagnostic},
         )
 
-    dropped_events = sum(
-        int(sidecar.metadata.get("dropped_events", 0)) for sidecar in sidecars
-    )
+    dropped_events = sum(_dropped_event_count(sidecar) for sidecar in sidecars)
     uncorrelated_events = sum(
         1
         for sidecar in sidecars
@@ -305,14 +392,37 @@ def build_merged_trace(
             {str(sidecar.metadata.get("session_id")) for sidecar in sidecars},
         ),
         "sidecars": len(sidecars),
+        "sidecar_integrity": [_sidecar_integrity(item) for item in sidecars],
         "dropped_events": dropped_events,
         "uncorrelated_events": uncorrelated_events,
         "error_events": error_events,
+        "incomplete_ranges": incomplete_ranges,
         "flows": flow_report,
         "device_flows": device_flow_report,
         "profiler_traces": profiler_report,
     }
     return {"traceEvents": trace_events, "displayTimeUnit": "us"}, report
+
+
+def _sidecar_integrity(sidecar: Sidecar) -> dict[str, object]:
+    expected_events = (
+        int(sidecar.summary["event_count"]) if sidecar.summary is not None else None
+    )
+    return {
+        "sidecar": str(sidecar.path),
+        "finalized": sidecar.summary is not None,
+        "loaded_events": len(sidecar.events),
+        "expected_events": expected_events,
+        "event_count_matches": (
+            expected_events is None or expected_events == len(sidecar.events)
+        ),
+    }
+
+
+def _dropped_event_count(sidecar: Sidecar) -> int:
+    if sidecar.summary is not None:
+        return int(sidecar.summary.get("dropped_events", 0))
+    return int(sidecar.metadata.get("dropped_events", 0))
 
 
 def _sidecar_paths(sidecars: Iterable[Sidecar]) -> Iterable[tuple[Path, Sidecar]]:
@@ -348,6 +458,7 @@ def _sidecar_trace_events(
     sidecar: Sidecar,
     origin_ns: int,
     flow_events: dict[str, list[tuple[Sidecar, dict[str, object], int]]],
+    incomplete_ranges: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     if sidecar.transform is None:
         raise RuntimeError("clock transform has not been assigned")
@@ -363,7 +474,12 @@ def _sidecar_trace_events(
         key = (str(event["event"]), flow_id if isinstance(flow_id, str) else None)
         if event["phase"] == "begin":
             open_events[key].append((event, global_ns))
-        elif event["phase"] == "end" and open_events[key]:
+        elif event["phase"] == "end":
+            if not open_events[key]:
+                incomplete_ranges.append(
+                    _incomplete_range(sidecar, event, missing_phase="begin"),
+                )
+                continue
             begin_event, begin_ns = open_events[key].pop(0)
             output.append(
                 _complete_trace_event(
@@ -387,7 +503,26 @@ def _sidecar_trace_events(
                     "args": _event_args(event),
                 },
             )
+    for unmatched in open_events.values():
+        incomplete_ranges.extend(
+            _incomplete_range(sidecar, event, missing_phase="end")
+            for event, _ in unmatched
+        )
     return output
+
+
+def _incomplete_range(
+    sidecar: Sidecar,
+    event: dict[str, object],
+    *,
+    missing_phase: str,
+) -> dict[str, object]:
+    return {
+        "sidecar": str(sidecar.path),
+        "event": event["event"],
+        "missing_phase": missing_phase,
+        **_event_args(event),
+    }
 
 
 def _complete_trace_event(
@@ -427,6 +562,7 @@ def _event_args(event: dict[str, object]) -> dict[str, object]:
 def _build_flow_events(
     flow_events: dict[str, list[tuple[Sidecar, dict[str, object], int]]],
     origin_ns: int,
+    sidecars: list[Sidecar],
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     trace_events: list[dict[str, object]] = []
     incomplete: list[dict[str, object]] = []
@@ -434,8 +570,40 @@ def _build_flow_events(
     for flow_index, (flow_id, entries) in enumerate(sorted(flow_events.items())):
         present_events = {str(event["event"]) for _, event, _ in entries}
         missing = sorted(REQUIRED_FLOW_EVENTS - present_events)
-        if missing:
-            incomplete.append({"flow_id": flow_id, "missing_events": missing})
+        present_phases = {
+            (sidecar.pid, str(event["event"]), str(event["phase"]))
+            for sidecar, event, _ in entries
+        }
+        missing_participants = [
+            {
+                "sidecar": str(sidecar.path),
+                "role": sidecar.identity["role"],
+                "role_rank": sidecar.identity["role_rank"],
+                "event": event_name,
+                "missing_phases": [
+                    phase
+                    for phase in ("begin", "end")
+                    if (sidecar.pid, event_name, phase) not in present_phases
+                ],
+            }
+            for sidecar in sidecars
+            for event_name in ROLE_FLOW_EVENTS.get(
+                str(sidecar.identity["role"]),
+                frozenset(),
+            )
+            if any(
+                (sidecar.pid, event_name, phase) not in present_phases
+                for phase in ("begin", "end")
+            )
+        ]
+        if missing or missing_participants:
+            incomplete.append(
+                {
+                    "flow_id": flow_id,
+                    "missing_events": missing,
+                    "missing_participants": missing_participants,
+                },
+            )
 
         trace_events.extend(
             _logical_flow_span(
@@ -561,6 +729,9 @@ def _align_profiler_events(
                 float(event["ts"]),
             )
 
+    for matches in marker_times.values():
+        matches.sort()
+
     if sidecar.transform is None:
         raise RuntimeError("clock transform has not been assigned")
     deltas_us: list[float] = []
@@ -593,6 +764,11 @@ def _align_profiler_events(
     for original in profiler_events:
         event = dict(original)
         event["pid"] = pid_map[int(event.get("pid", 0))]
+        args = event.get("args")
+        event["args"] = {
+            **(args if isinstance(args, dict) else {}),
+            CORRELATION_PID_ARG: sidecar.pid,
+        }
         if "ts" in event:
             # ts and dur are both us (epoch us for ts); shift to the merged
             # origin so device events sit on the correlation axis.
@@ -615,6 +791,7 @@ def _expand_sidecars(paths: Iterable[Path]) -> list[Path]:
     for path in paths:
         if path.is_dir():
             expanded.extend(sorted(path.rglob("afd-trace-*.jsonl")))
+            expanded.extend(sorted(path.rglob("afd-trace-*.jsonl.tmp")))
         else:
             expanded.append(path)
     return expanded
@@ -650,6 +827,7 @@ def main() -> None:
         clock_sync.get("session_id") not in session_ids for clock_sync in clock_syncs
     ):
         raise ValueError("clock-sync and sidecar session IDs differ")
+    validate_clock_sync_coverage(sidecars, clock_syncs)
     clock_diagnostics = assign_clock_transforms(sidecars, clock_syncs)
     trace, report = build_merged_trace(sidecars, args.profiler_trace)
     report["clock_alignment"] = clock_diagnostics

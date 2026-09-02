@@ -84,6 +84,11 @@ export TP_SOCKET_IFNAME="$NIC_NAME"
 export HCCL_SOCKET_IFNAME="$NIC_NAME"
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 
+PROFILER_ARGS=()
+if [[ -n "${VLLM_TORCH_PROFILER_DIR:-}" ]]; then
+  PROFILER_ARGS=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${VLLM_TORCH_PROFILER_DIR}\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true,\"ignore_frontend\":true}")
+fi
+
 ADDITIONAL_CONFIG="$(
   printf '%s' "{
     \"enable_force_load_balance\": false,
@@ -126,4 +131,5 @@ exec env VLLM_USE_V1=1 vllm serve "$MODEL_PATH" \
   --no-enable-prefix-caching \
   --quantization ascend \
   --tokenizer-mode deepseek_v32 \
+  "${PROFILER_ARGS[@]}" \
   --additional-config "$ADDITIONAL_CONFIG"

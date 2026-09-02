@@ -30,6 +30,7 @@ from vllm.v1.worker.ubatch_utils import (
 
 from afd_plugin.compat.profiler import (
     create_afd_gpu_profiler,
+    start_afd_gpu_profiler,
     step_afd_gpu_profiler,
     stop_afd_gpu_profiler,
 )
@@ -86,11 +87,28 @@ class AFDAttentionModelRunner(GPUModelRunner):
         self._afd_pending_metadata: AFDForwardContextMetadata | None = None
         self._afd_suppress_metadata_send = False
         self._afd_transaction_counter = 0
-        self.prof = create_afd_gpu_profiler("attention")
+        self.prof = create_afd_gpu_profiler(
+            "attention",
+            vllm_config.profiler_config,
+        )
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:
         return parse_afd_config(vllm_config, expected_role="attention")
+
+    def start_profile(
+        self,
+        profile_prefix: str | None,
+        global_rank: int,
+    ) -> None:
+        start_afd_gpu_profiler(
+            self.prof,
+            profile_prefix=profile_prefix,
+            global_rank=global_rank,
+        )
+
+    def stop_profile(self) -> None:
+        stop_afd_gpu_profiler(self.prof)
 
     def _build_afd_metadata(
         self,

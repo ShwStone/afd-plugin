@@ -64,6 +64,9 @@ MW_PLANS = f"{MW_DIR}/plans"
 
 SERVER_READY_TIMEOUT_S = 2400
 SERVER_POLL_S = 15
+PROFILE_REQUEST_TIMEOUT_S = 1800
+ATTENTION_SERVER_PORT = 8000
+FFN_SERVER_PORT = 8001
 KILL_PATTERN = "[/]vllm serve|[Vv][Ll][Ll][Mm]::|[V]LLMWorker|multiproc_[e]xecutor"
 
 
@@ -245,50 +248,35 @@ def start_server(system: str, variant: str | None) -> str:
 def _profile_envs(
     system: str, variant: str | None
 ) -> dict[str, dict[str, str]]:
-    """Profiler env per role when FP_PROFILE=1 (diagnostic runs only)."""
-    if os.environ.get("FP_PROFILE") != "1":
+    """Profiler and independently enabled correlation output settings."""
+    profile_enabled = os.environ.get("FP_PROFILE") == "1"
+    correlation_enabled = profile_enabled or os.environ.get("FP_CORRELATION") == "1"
+    if not profile_enabled and not correlation_enabled:
         return {}
+
     trace_root = f"{result_root()}/02_profiles_32/traces"
-    window = {
-        "WAIT": "0",
-        "WARMUP": "1",
-        "ACTIVE": os.environ.get("FP_PROFILE_ACTIVE", "5"),
-        "SKIP_FIRST": os.environ.get("FP_PROFILE_SKIP_FIRST", "10"),
-        "REPEAT": "1",
-    }
-    # Correlation tracing writes cross-role timeline sidecars alongside
-    # the torch_npu traces so the merge tool can align attention dispatch
-    # and FFN compute events.
-    label = system if variant is None else f"{system}_{variant.lower()}"
-    corr_dir = f"{trace_root}/correlation/{label}"
-    corr_id = hashlib.sha256(
-        f"{label}_{time.time()}".encode()
-    ).hexdigest()[:16]
-    correlation = {
-        "AFD_TRACE_ENABLE": "1",
-        "AFD_TRACE_SESSION_ID": corr_id,
-        "AFD_TRACE_DIR": corr_dir,
-    }
-    return {
-        "baseline": {"VLLM_TORCH_PROFILER_DIR": f"{trace_root}/baseline"},
-        "attention": {
-            f"AFD_NPU_ATTENTION_PROFILER_{key}": value
-            for key, value in window.items()
+    role_envs: dict[str, dict[str, str]] = {}
+    if profile_enabled:
+        role_envs = {
+            "baseline": {"VLLM_TORCH_PROFILER_DIR": f"{trace_root}/baseline"},
+            "attention": {
+                "VLLM_TORCH_PROFILER_DIR": f"{trace_root}/attention",
+            },
+            "ffn": {"VLLM_TORCH_PROFILER_DIR": f"{trace_root}/ffn"},
         }
-        | {
-            "AFD_NPU_ATTENTION_PROFILER_ENABLE": "1",
-            "AFD_NPU_ATTENTION_PROFILER_DIR": f"{trace_root}/attention",
-            **correlation,
-        },
-        "ffn": {
-            f"AFD_NPU_FFN_PROFILER_{key}": value for key, value in window.items()
+
+    if system == "afd" and correlation_enabled:
+        label = system if variant is None else f"{system}_{variant.lower()}"
+        correlation = {
+            "AFD_TRACE_ENABLE": "1",
+            "AFD_TRACE_SESSION_ID": hashlib.sha256(
+                f"{label}_{time.time()}".encode()
+            ).hexdigest()[:16],
+            "AFD_TRACE_DIR": f"{trace_root}/correlation/{label}",
         }
-        | {
-            "AFD_NPU_FFN_PROFILER_ENABLE": "1",
-            "AFD_NPU_FFN_PROFILER_DIR": f"{trace_root}/ffn",
-            **correlation,
-        },
-    }
+        role_envs.setdefault("attention", {}).update(correlation)
+        role_envs.setdefault("ffn", {}).update(correlation)
+    return role_envs
 
 
 def _wait_log_marker(
@@ -310,10 +298,13 @@ def _wait_log_marker(
             text=True,
             timeout=60,
         )
-        if probe.returncode == 0 and probe.stdout.strip().isdigit():
-            if int(probe.stdout.strip()) > 0:
-                print(f"[_wait_log_marker] {marker!r} seen on {pod}", flush=True)
-                return
+        if (
+            probe.returncode == 0
+            and probe.stdout.strip().isdigit()
+            and int(probe.stdout.strip()) > 0
+        ):
+            print(f"[_wait_log_marker] {marker!r} seen on {pod}", flush=True)
+            return
         time.sleep(30)
     raise TimeoutError(f"marker {marker!r} not seen in {log_path} on {pod}")
 
@@ -524,6 +515,51 @@ def phase_fixed(system: str, variant: str | None, dp_rank: int) -> None:
     print(f"[fixed] {label} done", flush=True)
 
 
+def _set_profile_state(pod: str, port: int, *, start: bool) -> None:
+    action = "start" if start else "stop"
+    itask_exec(
+        pod,
+        "curl --fail --silent --show-error "
+        f"--max-time {PROFILE_REQUEST_TIMEOUT_S} -X POST "
+        f"http://127.0.0.1:{port}/{action}_profile",
+        timeout=PROFILE_REQUEST_TIMEOUT_S + 60,
+    )
+
+
+def _start_afd_profile() -> None:
+    node0, node1 = env("FP_NODE0"), env("FP_NODE1")
+    try:
+        _set_profile_state(node1, FFN_SERVER_PORT, start=True)
+        _set_profile_state(node0, ATTENTION_SERVER_PORT, start=True)
+    except RuntimeError:
+        # A failed distributed RPC may still have started a subset of workers,
+        # so stop both roles rather than only the previously completed request.
+        try:
+            _stop_afd_profile()
+        except RuntimeError as rollback_error:
+            print(
+                f"[profile] failed to roll back AFD profilers: {rollback_error}",
+                flush=True,
+            )
+        raise
+
+
+def _stop_afd_profile() -> None:
+    node0, node1 = env("FP_NODE0"), env("FP_NODE1")
+    first_error: RuntimeError | None = None
+    for pod, port in (
+        (node0, ATTENTION_SERVER_PORT),
+        (node1, FFN_SERVER_PORT),
+    ):
+        try:
+            _set_profile_state(pod, port, start=False)
+        except RuntimeError as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+
+
 def phase_profile(
     system: str,
     variant: str | None,
@@ -533,9 +569,9 @@ def phase_profile(
 ) -> None:
     """Plan sections 8.3/9.2: bounded profiler replay of one fixed batch.
 
-    Requires FP_PROFILE=1 so servers boot with profiler switches. Baseline
-    uses the upstream /start_profile API; AFD roles use the plugin-owned
-    env-scheduled profiler (see afd_plugin/compat/npu/profiler.py).
+    Requires FP_PROFILE=1 so servers boot with profiler support. Both baseline
+    and AFD use vLLM's /start_profile and /stop_profile APIs; AFD controls its
+    independent FFN and Attention servers in pipeline-safe order.
 
     ``precollect_batch`` re-runs one fixed batch un-instrumented right after
     boot (before profiling starts) — used to re-collect keepalive-tainted
@@ -548,46 +584,60 @@ def phase_profile(
     kill_all()
     start_server(system, variant)
     wait_server()
-    if precollect_batch:
-        fixed_out = f"{result_root()}/01_fixed_batch/{label}"
-        run_client_on_node0(
-            "python3 -m tools.benchmarks.fixed_batch_client "
-            "--base-url http://127.0.0.1:8000 "
-            f"--dataset {MW_WORKLOADS}/{precollect_batch}.jsonl "
-            f"--dp-rank {dp_rank} --repeats 10 --warmups 1 "
-            f"--output {fixed_out}/{precollect_batch}.fixed_batch.json",
-            timeout=7200,
-        )
-        print(f"[profile] pre-collected clean {precollect_batch}", flush=True)
-    if system == "baseline":
-        itask_exec(
-            env("FP_NODE0"),
-            "curl -s -X POST http://127.0.0.1:8000/start_profile || true",
-        )
-        time.sleep(5)
-    # All-DP collection passes dp_rank=-1: no pin header, the DP router
-    # spreads bursts across every replica so all ranks get profiled steps.
-    repeats = os.environ.get("FP_PROFILE_REPEATS", "4")
-    warmups = os.environ.get("FP_PROFILE_WARMUPS", "1")
-    suffix = "_alldp" if dp_rank < 0 else ""
-    run_client_on_node0(
-        "python3 -m tools.benchmarks.fixed_batch_client "
-        "--base-url http://127.0.0.1:8000 "
-        f"--dataset {MW_WORKLOADS}/{batch}.jsonl "
-        f"--dp-rank {dp_rank} --repeats {repeats} --warmups {warmups} "
-        f"--output {out_dir}/{batch}.profile_replay{suffix}.json",
-        timeout=7200,
-    )
-    if system == "baseline":
-        itask_exec(
-            env("FP_NODE0"),
-            "curl -s -X POST http://127.0.0.1:8000/stop_profile || true",
-        )
-    # Graceful shutdown flushes the correlation sidecar JSONL files
-    # before the next phase's kill_all(9) discards in-memory events.
-    _graceful_shutdown()
-    # Traces flush asynchronously; give the profiler time to write.
-    time.sleep(60)
+    profile_started = False
+    try:
+        if precollect_batch:
+            fixed_out = f"{result_root()}/01_fixed_batch/{label}"
+            run_client_on_node0(
+                "python3 -m tools.benchmarks.fixed_batch_client "
+                "--base-url http://127.0.0.1:8000 "
+                f"--dataset {MW_WORKLOADS}/{precollect_batch}.jsonl "
+                f"--dp-rank {dp_rank} --repeats 10 --warmups 1 "
+                f"--output {fixed_out}/{precollect_batch}.fixed_batch.json",
+                timeout=7200,
+            )
+            print(f"[profile] pre-collected clean {precollect_batch}", flush=True)
+        if system == "baseline":
+            _set_profile_state(
+                env("FP_NODE0"),
+                ATTENTION_SERVER_PORT,
+                start=True,
+            )
+            profile_started = True
+            time.sleep(5)
+        else:
+            _start_afd_profile()
+            profile_started = True
+        try:
+            # All-DP collection passes dp_rank=-1: no pin header, the DP router
+            # spreads bursts across every replica so all ranks get profiled steps.
+            repeats = os.environ.get("FP_PROFILE_REPEATS", "4")
+            warmups = os.environ.get("FP_PROFILE_WARMUPS", "1")
+            suffix = "_alldp" if dp_rank < 0 else ""
+            run_client_on_node0(
+                "python3 -m tools.benchmarks.fixed_batch_client "
+                "--base-url http://127.0.0.1:8000 "
+                f"--dataset {MW_WORKLOADS}/{batch}.jsonl "
+                f"--dp-rank {dp_rank} --repeats {repeats} --warmups {warmups} "
+                f"--output {out_dir}/{batch}.profile_replay{suffix}.json",
+                timeout=7200,
+            )
+        finally:
+            if profile_started:
+                if system == "baseline":
+                    _set_profile_state(
+                        env("FP_NODE0"),
+                        ATTENTION_SERVER_PORT,
+                        start=False,
+                    )
+                else:
+                    _stop_afd_profile()
+    finally:
+        # Graceful shutdown writes the sidecar summary and atomically finalizes
+        # each streamed .jsonl.tmp file before the next phase cleans up.
+        _graceful_shutdown()
+        # Traces flush asynchronously; give the profiler time to write.
+        time.sleep(60)
     print(f"[profile] {label} replay done; traces under "
           f"{result_root()}/02_profiles_32/traces", flush=True)
 
@@ -595,12 +645,11 @@ def phase_profile(
 def _graceful_shutdown() -> None:
     """SIGTERM the AFD servers and wait for them to call connector.close().
 
-    The correlation trace recorder buffers events in memory and only
-    flushes them to the JSONL sidecar during ``CAMAsyncAFDConnector.close()``
-    (→ ``trace_recorder.close()``). pkill -9 skips that path entirely, so
-    correlation files are lost on every hard-kill. Send SIGTERM first, let
-    the workers run ``shutdown()`` → ``connector.close()``, then clean up
-    any stragglers with SIGKILL.
+    The correlation trace recorder streams events to a temporary sidecar.
+    ``CAMAsyncAFDConnector.close()`` writes its completion/drop summary and
+    atomically renames that file to ``.jsonl``. A hard kill skips finalization,
+    so send SIGTERM first, let workers run ``shutdown()`` →
+    ``connector.close()``, then clean up any stragglers with SIGKILL.
     """
     node0, node1 = env("FP_NODE0"), env("FP_NODE1")
     for pod in (node0, node1):
@@ -616,7 +665,7 @@ def _graceful_shutdown() -> None:
     for pod in (node0, node1):
         itask_exec(
             pod,
-            "pkill -9 -f '[/]vllm serve|[Vv][Ll][Ll][Mm]::|[V]LLMWorker|multiproc_[e]xecutor' || true",
+            f"pkill -9 -f '{KILL_PATTERN}' || true",
             retries=0,
         )
     print("[shutdown] graceful pkill + 15s drain + SIGKILL clean", flush=True)

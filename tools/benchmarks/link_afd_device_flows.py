@@ -46,6 +46,7 @@ EVENT_TO_DEVICE_OP: dict[str, str] = {
     "afd.cam.combine_send": "CamMoeDistributeCombineSend",
 }
 DEVICE_FLOW_CATEGORY = "afd.device-flow"
+CORRELATION_PID_ARG = "afd_correlation_pid"
 
 # First id reserved for device-op flows; the merge tool's correlation flows use
 # small sequential ids, so start well above them to avoid collisions.
@@ -98,17 +99,33 @@ def _pair_fifo(
 
 def _correlation_markers(
     events: list[dict[str, object]],
-) -> dict[tuple[str, str], dict[str, object]]:
-    """Index correlation X events by (event name, flow_id)."""
-    index: dict[tuple[str, str], dict[str, object]] = {}
+) -> tuple[
+    dict[tuple[int, str, str], dict[str, object]],
+    dict[tuple[str, str], list[dict[str, object]]],
+]:
+    """Index correlation slices by process and by logical marker."""
+
+    by_process: dict[tuple[int, str, str], dict[str, object]] = {}
+    by_marker: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
     for event in events:
         if event.get("ph") != "X" or event.get("cat") != "afd.correlation":
             continue
-        args = event.get("args") or {}
+        args = event.get("args")
+        if not isinstance(args, dict):
+            continue
         flow_id = args.get("flow_id")
         if isinstance(flow_id, str):
-            index[(str(event.get("name")), flow_id)] = event
-    return index
+            marker = (str(event.get("name")), flow_id)
+            by_process[(int(event["pid"]), *marker)] = event
+            by_marker[marker].append(event)
+    return by_process, by_marker
+
+
+def _profiler_group(event: dict[str, object]) -> int | None:
+    args = event.get("args")
+    if not isinstance(args, dict) or CORRELATION_PID_ARG not in args:
+        return None
+    return int(args[CORRELATION_PID_ARG])
 
 
 def _flow_endpoint(
@@ -147,58 +164,85 @@ def build_device_flows(
     device_ops = [
         event for event in events if event.get("name") in EVENT_TO_DEVICE_OP.values()
     ]
-    corr_index = _correlation_markers(events)
+    corr_by_process, corr_by_marker = _correlation_markers(events)
+    profiler_groups = {
+        _profiler_group(event) for markers in mstx.values() for event in markers
+    }
 
     flows: list[dict[str, object]] = []
     linked = 0
     skipped = 0
-    for event_name, flow_id, _mstx_marker, device_op in _pair_fifo(mstx, device_ops):
-        # The mstx marker's event name + flow_id uniquely selects the sidecar
-        # correlation marker for the same logical exchange.
-        corr_event = corr_index.get((event_name, flow_id))
-        if corr_event is None:
-            skipped += 1
-            continue
+    ambiguous = 0
+    for profiler_group in sorted(
+        profiler_groups,
+        key=lambda group: -1 if group is None else group,
+    ):
+        grouped_mstx = {
+            event_name: [
+                event for event in markers if _profiler_group(event) == profiler_group
+            ]
+            for event_name, markers in mstx.items()
+        }
+        grouped_ops = [
+            event for event in device_ops if _profiler_group(event) == profiler_group
+        ]
+        for event_name, flow_id, _mstx_marker, device_op in _pair_fifo(
+            grouped_mstx,
+            grouped_ops,
+        ):
+            marker = (event_name, flow_id)
+            if profiler_group is None:
+                candidates = corr_by_marker.get(marker, [])
+                if len(candidates) > 1:
+                    ambiguous += 1
+                    continue
+                corr_event = candidates[0] if candidates else None
+            else:
+                corr_event = corr_by_process.get((profiler_group, *marker))
+            if corr_event is None:
+                skipped += 1
+                continue
 
-        chrome_flow_id = _ID_BASE + linked
-        # Legacy Chrome/Perfetto flows are keyed by category + name + ID.
-        # Keep the descriptive endpoint names on their enclosing slices and
-        # give both synthetic flow endpoints one shared flow name.
-        flow_name = f"{event_name} -> {device_op['name']}"
-        # Arrow always points forward in time: earlier endpoint is "s".
-        corr_ts = float(corr_event["ts"])
-        dev_ts = float(device_op["ts"])
-        if corr_ts <= dev_ts:
-            source, target = corr_event, device_op
-        else:
-            source, target = device_op, corr_event
-        flows.append(
-            _flow_endpoint(
-                name=flow_name,
-                flow_id=flow_id,
-                chrome_flow_id=chrome_flow_id,
-                phase="s",
-                pid=source["pid"],
-                tid=source["tid"],
-                ts=float(source["ts"]),
-            ),
-        )
-        flows.append(
-            _flow_endpoint(
-                name=flow_name,
-                flow_id=flow_id,
-                chrome_flow_id=chrome_flow_id,
-                phase="f",
-                pid=target["pid"],
-                tid=target["tid"],
-                ts=float(target["ts"]),
-            ),
-        )
-        linked += 1
+            chrome_flow_id = _ID_BASE + linked
+            # Legacy Chrome/Perfetto flows are keyed by category + name + ID.
+            # Keep the descriptive endpoint names on their enclosing slices and
+            # give both synthetic flow endpoints one shared flow name.
+            flow_name = f"{event_name} -> {device_op['name']}"
+            # Arrow always points forward in time: earlier endpoint is "s".
+            corr_ts = float(corr_event["ts"])
+            dev_ts = float(device_op["ts"])
+            if corr_ts <= dev_ts:
+                source, target = corr_event, device_op
+            else:
+                source, target = device_op, corr_event
+            flows.append(
+                _flow_endpoint(
+                    name=flow_name,
+                    flow_id=flow_id,
+                    chrome_flow_id=chrome_flow_id,
+                    phase="s",
+                    pid=source["pid"],
+                    tid=source["tid"],
+                    ts=float(source["ts"]),
+                ),
+            )
+            flows.append(
+                _flow_endpoint(
+                    name=flow_name,
+                    flow_id=flow_id,
+                    chrome_flow_id=chrome_flow_id,
+                    phase="f",
+                    pid=target["pid"],
+                    tid=target["tid"],
+                    ts=float(target["ts"]),
+                ),
+            )
+            linked += 1
 
     report = {
         "linked_device_flows": linked,
         "skipped_missing_correlation": skipped,
+        "skipped_ambiguous_correlation": ambiguous,
         "id_base": _ID_BASE,
     }
     return flows, report
