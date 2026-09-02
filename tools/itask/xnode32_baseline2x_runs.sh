@@ -27,7 +27,9 @@ S="timeout --signal=KILL 45 itask exec"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 
 CWS_CFG='{"enable_force_load_balance":false,"enable_prefill_mc2":false,"enable_dsv4_shared_compressor_workspace":true,"multistream_dsv4_dsa_overlap":false}'
-BENV="DP_SIZE=4 TP_SIZE=4 MAX_NUM_BATCHED_TOKENS=8192 PORT=8000 ADDITIONAL_CONFIG=$CWS_CFG"
+# NOTE: ADDITIONAL_CONFIG must stay single-quoted at the remote bash -c layer;
+# unquoted {...a,b...} JSON is mangled by remote-side brace expansion.
+BENV="DP_SIZE=4 TP_SIZE=4 MAX_NUM_BATCHED_TOKENS=8192 PORT=8000 ADDITIONAL_CONFIG='$CWS_CFG'"
 
 say "== preflight: cleanup script + plans + launcher =="
 for P in "$MASTER" "$SECOND"; do
