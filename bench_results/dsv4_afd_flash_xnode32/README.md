@@ -91,3 +91,34 @@
 
 - 本地：`bench_results/dsv4_afd_flash_xnode32/baseline2x/base2x_mbt8192_{1x,fast1p5x,fast2x}.json`
 - NAS：`shwstone/xnode32_baseline2x/`（3 JSON + 两侧实例日志 + router 日志 + 路由决策 jsonl）
+
+## baseline mbt 补扫：32768 与 65536（2026-09-02 第二轮）
+
+驱动同前（`MBT` 环境变量参数化），三档 1x/1.5x/2x。
+
+**mbt=65536：不可行（OOM）**。1x 回放开始 ~1 分钟后 node2 的 Worker_DP0_TP0 运行中 OOM：尝试分配 7.89 GiB，仅剩 6.49 GiB（52.74 GiB 已分配，profile 阶段测得峰值激活仅 5.25 GiB——单步 65536-token 前向的真实峰值远超 profile 估计）。node2 整实例死亡，路由把后续请求全部倒向 node1（fail=30，健康的 node1 416 请求零失败）。该档中止，数据作废。
+
+**mbt=32768：三档全 512/512 零失败**，但与 8k 呈现相反的 trade-off：
+
+| 指标 | base 8k | base 32k | AFD 64k（参照） |
+|---|---|---|---|
+| 1x eff / 排空 | 32,236 / 13.2s | 31,789 / 15.5s | 33,400 / 7.5s |
+| 1x TTFT p50/p99/max | **2.84/11.31/15.15** | 6.87/16.28/26.16 | 2.22/7.29/8.35 |
+| 1.5x eff / 排空 | 44,444 / 18.4s | **47,357 / 11.1s** | 47,368 / 11.1s |
+| 1.5x TTFT p50/p99 | **3.42/12.94** | 7.89/15.26 | 4.45/11.37 |
+| 2x eff / 排空 | **58,886 / 14.3s** | 58,339 / 15.2s | 60,486 / 12.0s |
+| 2x TTFT p50/p99 | 5.77/16.63 | 8.08/16.82 | **5.44/13.91** |
+| 2x 峰值 15s 桶 | 67,888 | 81,058* | 77,193 |
+
+*32k 的 81K 峰值桶含大 chunk 批量完成的对桶运气成分；看持续桶（45-75s）：32k 为 69-73K，仍低于 AFD 的 75-77K。且 32k 起步慢（首桶仅 25.9K vs 8k 的 37.3K vs AFD 43.7K），清尾拖到 90-105s 桶。
+
+### 读数
+
+- **baseline 的 mbt 是二选一**：8k = 延迟好、突发上限低（~68K）；32k = 吞吐追平 AFD、但 p50 全面劣化 2-3.5 秒（TP4 大 chunk 单步时长命名排队，与 8 月矩阵 DP4TP4EP16×65536 异常格同机理）；65536 = 直接 OOM 起不来服务级负载
+- **AFD 解耦了这个 trade-off**：attention 侧 mbt=65536 大 chunk 拿服务率，FFN 分离后延迟不受大 chunk 连坐——同 32 卡下延迟与服务率同时最优
+- baseline 三个 mbt 里 8k 是综合最优（1x/2x eff 最高、延迟最好），与"按用户指定 8k"的原选择一致
+
+### 归档
+
+- 本地：`baseline2x/base2x_mbt32768_{1x,fast1p5x,fast2x}.json`（SHA256 校验）
+- NAS：`shwstone/xnode32_baseline2x/base2x_mbt32768_*`（3 JSON + 双实例日志 + router 日志/决策）；`base2x_mbt65536_*` 保留 OOM 现场日志供排查

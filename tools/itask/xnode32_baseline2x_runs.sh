@@ -44,7 +44,7 @@ else
 $S "$MASTER" -- bash /tmp/xnode32_cleanup.sh 2>&1 | tr -d '\r' | tail -2
 $S "$SECOND" -- bash /tmp/xnode32_cleanup.sh 2>&1 | tr -d '\r' | tail -2
 
-say "== start baseline instances (DP4TP4EP16, mbt=8192, CWS on) =="
+say "== start baseline instances (DP4TP4EP16, mbt=$MBT, CWS on) =="
 $S "$MASTER" -- bash -c "setsid bash -c 'env $BENV nohup bash $BASE_LAUNCHER > /tmp/${TAG}_n1.log 2>&1 &' ; echo started" 2>&1 | tr -d '\r' | tail -1
 $S "$SECOND" -- bash -c "setsid bash -c 'env $BENV nohup bash $BASE_LAUNCHER > /tmp/${TAG}_n2.log 2>&1 &' ; echo started" 2>&1 | tr -d '\r' | tail -1
 fi
