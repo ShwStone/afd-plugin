@@ -1046,7 +1046,7 @@ def test_attention_runner_constructor_does_not_initialize_connector(monkeypatch)
     monkeypatch.setattr(
         attention_model_runner,
         "create_afd_gpu_profiler",
-        lambda _name: object(),
+        lambda *_args: object(),
     )
     monkeypatch.setattr(
         AFDAttentionModelRunner,
@@ -1055,7 +1055,7 @@ def test_attention_runner_constructor_does_not_initialize_connector(monkeypatch)
     )
     _fake_connector_factory(monkeypatch, connector)
 
-    runner = AFDAttentionModelRunner(SimpleNamespace(), SimpleNamespace(index=0))
+    runner = AFDAttentionModelRunner(SimpleNamespace(profiler_config=None), SimpleNamespace(index=0))
 
     assert runner.connector is connector
     # Connector construction is device-light; the collective rendezvous is

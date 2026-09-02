@@ -23,6 +23,7 @@ from afd_plugin.connectors import (
     AFDForwardContextMetadata,
     AFDTransferContext,
     AFDTransferMetadata,
+    ensure_afd_transaction_id,
 )
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.models.npu.async_cam_layout import (
@@ -179,7 +180,7 @@ def run_attention_gate_afd_forward(
             layer_idx=layer.layer_idx,
             stage_idx=stage_idx,
             seq_len=int(dispatch_payload.hidden_states.shape[0]),
-            transaction_id=afd_metadata.ensure_transaction_id(),
+            transaction_id=ensure_afd_transaction_id(afd_metadata),
         )
         context = AFDTransferContext(metadata=metadata)
         afd_connector.send_attn_output(
@@ -378,7 +379,7 @@ def run_async_moe_ubatch_afd_forward(
             layer_idx=layer.layer_idx,
             stage_idx=stage_idx,
             seq_len=int(dispatch_payload.hidden_states.shape[0]),
-            transaction_id=afd_metadata.ensure_transaction_id(),
+            transaction_id=ensure_afd_transaction_id(afd_metadata),
         )
         stage_context = AFDTransferContext(metadata=stage_metadata)
         afd_connector.send_attn_output(

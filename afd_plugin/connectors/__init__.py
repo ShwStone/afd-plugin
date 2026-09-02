@@ -10,6 +10,7 @@ from afd_plugin.connectors.base import (
 from afd_plugin.connectors.factory import AFDConnectorFactory
 from afd_plugin.connectors.metadata import (
     AFDA2FTransferPayload,
+    ensure_afd_transaction_id,
     AFDControlPayload,
     AFDDPMetadata,
     AFDExpertRoutingSpec,

@@ -376,6 +376,7 @@ class AFDNPUAttentionModelRunner(NPUModelRunner):
             cascade_attn_prefix_lens=cascade_attn_prefix_lens,
         )
         self._afd_async_moe_ubatch_metadata = None
+        self.ubatch_slices = None
         self._afd_pending_metadata = self._build_afd_metadata(
             None,
             num_tokens,

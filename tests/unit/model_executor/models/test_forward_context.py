@@ -180,7 +180,18 @@ def test_async_model_forward_preserves_pp_boundaries(
 
 def test_async_cam_profile_forward_runs_matched_connector_io(monkeypatch):
     from afd_plugin.model_executor.models.npu import (
+        async_cam_layout,
+    )
+    from afd_plugin.model_executor.models.npu import (
         deepseek_v2_async_cam_forward as async_forward,
+    )
+
+    # prepare_cam_dispatch_payload consults the TP group even for the trivial
+    # single-rank layout; fake a one-rank group.
+    monkeypatch.setattr(
+        async_cam_layout,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
     )
 
     forward_context = SimpleNamespace(

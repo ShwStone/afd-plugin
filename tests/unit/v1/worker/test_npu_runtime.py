@@ -230,13 +230,19 @@ def _vllm_config(
     compute_gate_on_attention = bool(
         parallel_overrides.pop("compute_gate_on_attention", False),
     )
+    tp_size = int(parallel_overrides.get("tensor_parallel_size", 1))
+    dp_size = int(parallel_overrides.get("data_parallel_size", 1))
+    role_world_size = tp_size * dp_size
     return SimpleNamespace(
+        profiler_config=None,
         additional_config={
             "afd": {
                 "role": role,
                 "connector": connector,
                 "async": async_dp,
                 "compute_gate_on_attention": compute_gate_on_attention,
+                "num_attention_ranks": role_world_size,
+                "num_ffn_ranks": role_world_size,
                 "connector_extra_config": extra_config or {},
             },
         },
@@ -542,7 +548,6 @@ def test_npu_attention_runner_builds_and_sets_metadata():
     runner._is_warmup = False
     runner._afd_is_graph_capturing = False
     runner._afd_pending_metadata = None
-    runner._afd_transaction_counter = 0
     runner.ubatch_slices = None
     runner._afd_suppress_metadata_send = False
     forward_context = SimpleNamespace(
@@ -573,7 +578,6 @@ def test_npu_attention_async_connector_skips_dp_metadata_control_plane():
     runner._afd_is_graph_capturing = False
     runner._afd_pending_metadata = None
     runner._afd_async_moe_ubatch_metadata = object()
-    runner._afd_transaction_counter = 0
     forward_context = SimpleNamespace(
         additional_kwargs={},
         dp_metadata=None,
@@ -593,7 +597,6 @@ def test_npu_attention_runner_builds_dp_fallback():
     runner = _new_attention_runner()
     runner.vllm_config = _vllm_config(role="attention")
     runner.connector = object()
-    runner._afd_transaction_counter = 0
     runner._afd_pending_metadata = runner._build_afd_metadata(None, 7)
 
     dp_metadata = runner._ensure_dp_metadata(None)
@@ -611,7 +614,6 @@ def test_npu_attention_runner_sends_graph_flags():
     runner.connector = _RecordingConnector()
     runner._is_warmup = True
     runner._afd_is_graph_capturing = True
-    runner._afd_transaction_counter = 0
     runner._afd_pending_metadata = runner._build_afd_metadata(None, 3)
 
     runner._send_dp_metadata(
@@ -888,7 +890,6 @@ def test_npu_attention_runner_builds_stage_metadata(monkeypatch):
     runner._is_warmup = False
     runner._afd_is_graph_capturing = False
     runner._afd_pending_metadata = None
-    runner._afd_transaction_counter = 0
     runner.afd_async_extra_info = AFDAsyncExtraInfo(
         async_moe_ubatching=True,
         async_moe_split="token",
@@ -980,7 +981,9 @@ def test_npu_attention_runner_builds_stage_metadata(monkeypatch):
     assert runner._afd_pending_metadata.num_stages == 1
     assert runner._afd_pending_metadata.tokens_start_loc == [0]
     assert runner._afd_pending_metadata.tokens_lens == [1099]
-    assert runner._afd_transaction_counter == 1
+    # Transaction ids are claimed lazily at the first dispatch, not at
+    # metadata build time.
+    assert runner._afd_pending_metadata.transaction_id is None
 
 
 def test_npu_attention_runner_isolates_dsa_caches_per_stage(monkeypatch):
@@ -2524,7 +2527,7 @@ def test_npu_attention_runner_constructor_does_not_initialize_connector(monkeypa
     monkeypatch.setattr(
         attention_model_runner,
         "create_afd_npu_profiler",
-        lambda _name: object(),
+        lambda *_args: object(),
     )
     monkeypatch.setattr(
         attention_model_runner.AFDNPUAttentionModelRunner,
@@ -2538,7 +2541,7 @@ def test_npu_attention_runner_constructor_does_not_initialize_connector(monkeypa
     _fake_npu_connector_factory(monkeypatch, connector)
 
     runner = attention_model_runner.AFDNPUAttentionModelRunner(
-        SimpleNamespace(),
+        SimpleNamespace(profiler_config=None),
         SimpleNamespace(index=0),
     )
 

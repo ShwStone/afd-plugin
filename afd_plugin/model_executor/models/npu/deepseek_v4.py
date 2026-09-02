@@ -32,6 +32,7 @@ from afd_plugin.connectors import (
     AFDF2ATransferPayload,
     AFDTransferContext,
     AFDTransferMetadata,
+    ensure_afd_transaction_id,
 )
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.model_executor.models.deepseek_v2 import RemoteFFNProxy
@@ -688,7 +689,7 @@ def _run_async_moe_ubatch_forward(
             layer_idx=layer.layer_idx,
             stage_idx=stage_idx,
             seq_len=int(dispatch.hidden_states.shape[0]),
-            transaction_id=afd_metadata.ensure_transaction_id(),
+            transaction_id=ensure_afd_transaction_id(afd_metadata),
         )
         afd_metadata.connector.send_attn_output(
             dispatch.hidden_states,

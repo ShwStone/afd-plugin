@@ -299,12 +299,18 @@ class AFDNPUFFNModelRunner(NPUModelRunner):
                     forward_context.dp_metadata = dp_metadata_list.get(stage_idx)
                     forward_context.additional_kwargs["afd_metadata"] = metadata
                     assert states, "Context.states must not be None"
-                    _install_ffn_input_ids(
-                        forward_context,
-                        _camp2p_input_ids_by_stage(self.connector).get(stage_idx),
-                        num_tokens=int(hidden_states.shape[0]),
-                        device=hidden_states.device,
-                    )
+                    stage_input_ids = _camp2p_input_ids_by_stage(
+                        self.connector,
+                    ).get(stage_idx)
+                    if stage_input_ids is None:
+                        forward_context.input_ids = None
+                    else:
+                        _install_ffn_input_ids(
+                            forward_context,
+                            stage_input_ids,
+                            num_tokens=int(hidden_states.shape[0]),
+                            device=hidden_states.device,
+                        )
                     _set_moe_layer_index(forward_context, layer_idx)
 
                     rank_ffn_output = self.model.compute_ffn_output(

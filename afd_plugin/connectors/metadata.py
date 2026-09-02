@@ -321,6 +321,20 @@ class AFDForwardContextMetadata:
             self.transaction_id = self.connector.claim_trace_transaction_id()
         return self.transaction_id
 
+
+def ensure_afd_transaction_id(
+    afd_metadata: AFDForwardContextMetadata,
+) -> str | None:
+    """Return the forward's transaction ID, claiming one lazily if possible.
+
+    Falls back to the pre-assigned ``transaction_id`` attribute (or ``None``)
+    for duck-typed metadata stand-ins used in tests.
+    """
+    ensure = getattr(afd_metadata, "ensure_transaction_id", None)
+    if ensure is not None:
+        return ensure()
+    return getattr(afd_metadata, "transaction_id", None)
+
     def clone(self) -> AFDForwardContextMetadata:
         cloned = copy.copy(self)
         cloned.tokens_start_loc = list(self.tokens_start_loc)

@@ -27,6 +27,7 @@ from afd_plugin.connectors import (
     AFDF2ATransferPayload,
     AFDTransferContext,
     AFDTransferMetadata,
+    ensure_afd_transaction_id,
 )
 from afd_plugin.model_executor.models import get_afd_metadata_from_forward_context
 from afd_plugin.v1.worker.dbo import maybe_apply_dbo_yield
@@ -136,7 +137,7 @@ class RemoteFFNProxy(nn.Module):
             layer_idx=self.layer_idx,
             stage_idx=stage_idx,
             seq_len=int(hidden_states.shape[0]),
-            transaction_id=afd_metadata.ensure_transaction_id(),
+            transaction_id=ensure_afd_transaction_id(afd_metadata),
         )
         context = AFDTransferContext(metadata=metadata)
         afd_metadata.connector.send_attn_output(
