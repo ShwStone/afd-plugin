@@ -37,12 +37,16 @@ done
 $S "$MASTER" -- bash -c "ls $WL/formal_1_plan.json $WL/formal_1_fast1p5x_plan.json $WL/formal_1_fast2x_plan.json $WL/formal_1_requests.jsonl >/dev/null && echo PLANS_OK" 2>&1 | tr -d '\r' | tail -1
 
 say "== cleanup both pods (AFD stack down) =="
+if [[ "${SKIP_START:-0}" == "1" ]]; then
+  say "SKIP_START=1: assuming instances already running"
+else
 $S "$MASTER" -- bash /tmp/xnode32_cleanup.sh 2>&1 | tr -d '\r' | tail -2
 $S "$SECOND" -- bash /tmp/xnode32_cleanup.sh 2>&1 | tr -d '\r' | tail -2
 
 say "== start baseline instances (DP4TP4EP16, mbt=8192, CWS on) =="
 $S "$MASTER" -- bash -c "setsid bash -c 'env $BENV nohup bash $BASE_LAUNCHER > /tmp/${TAG}_n1.log 2>&1 &' ; echo started" 2>&1 | tr -d '\r' | tail -1
 $S "$SECOND" -- bash -c "setsid bash -c 'env $BENV nohup bash $BASE_LAUNCHER > /tmp/${TAG}_n2.log 2>&1 &' ; echo started" 2>&1 | tr -d '\r' | tail -1
+fi
 
 wait_ready() { # $1=pod $2=logfile
   local POD=$1 LOG=$2
@@ -52,7 +56,7 @@ wait_ready() { # $1=pod $2=logfile
     OUT=$($S "$POD" -- bash -c 'curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/v1/models' 2>/dev/null | tr -d '\r' | tail -1)
     if [[ "$OUT" == *200* ]]; then return 0; fi
     local C
-    C=$($S "$POD" -- bash -c "grep -cE 'do tiling failed|507015|507057|Traceback|ValidationError|Free memory' $LOG 2>/dev/null || true" 2>/dev/null | tr -d '\r' | tail -1)
+    C=$($S "$POD" -- bash -c "grep -cE 'do tiling failed|507015|507057|Traceback|ValidationError|less than desired' $LOG 2>/dev/null || true" 2>/dev/null | tr -d '\r' | tail -1)
     if [[ "${C:-0}" != "0" ]]; then
       say "!! crash signature on $POD (count=$C)"
       $S "$POD" -- bash -c "grep -E 'ERROR|Error|Traceback' $LOG | tail -8" 2>&1 | tr -d '\r' | tail -8

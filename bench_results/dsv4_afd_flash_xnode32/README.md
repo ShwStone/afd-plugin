@@ -51,3 +51,43 @@
 - 本地：`bench_results/dsv4_afd_flash_xnode32/xnode32_mbt*.json`（4 格 mbt 扫描 + fast1p5x/fast2x，含逐请求 TTFT）、`formal_1_arrivals.png`（数据集到达形态图）
 - NAS：`shwstone/xnode32_results/`（全部 JSON + 三侧日志 + README）
 - 快放 plan：`tools/datasets/moonconv-wildchat-v4-flash-prefill/workloads/formal_1_fast{1p5x,2x}_plan.json`（52.6K/70.1K tok/s，窗口 100s/75s）；驱动 `tools/itask/xnode32_speed_runs.sh`
+
+## 对照实验：双实例 stock baseline（2026-09-02）
+
+**配置**：每节点一个独立 DP4TP4EP16 实例（16 卡×2=32 卡总量与 AFD 对齐），mbt=8192、FLASHCOMM1=1、CWS 开（与 AFD 格同代码 e19e14da7）、util 0.80、async-sched OFF、不设 HCCL_BUFFSIZE。实例间用 `tools/benchmarks/least_load_router.py` 做请求级路由：score = waiting + running + 路由侧 inflight（对齐 vLLM 内部 DP LB 语义；per-engine gauge 求和到实例级，0.5s 轮询 + inflight 补偿吸收突发）。驱动 `tools/itask/xnode32_baseline2x_runs.sh`。
+
+路由均衡性（决策日志）：1x 266/248、1.5x 257/255、2x 267/245（约 52/48），零失败。
+
+### 同口径对比（同数据集、同 32 卡、同指标定义）
+
+| 指标 | baseline 2×DP4TP4EP16 | AFD DP6TP4+DP8EP8 (mbt65536) | AFD 优势 |
+|---|---|---|---|
+| 1x 有效吞吐 | 32,236 | 33,400 | +3.6% |
+| 1x 排空 | 13.2s | 7.5s | −43% |
+| 1x TTFT p50/p99/max | 2.84/11.31/15.15 | 2.22/7.29/8.35 | −22%/−36%/−45% |
+| 1.5x 有效吞吐 | 44,444 | 47,368 | +6.6% |
+| 1.5x 排空 | 18.4s | 11.1s | −40% |
+| 1.5x TTFT p50/p99 | 3.42/12.94 | 4.45/11.37 | p50 −30%（baseline 优）/ p99 −12%（AFD 优） |
+| 2x 有效吞吐 | 58,886 | 60,486 | +2.7% |
+| 2x 排空 | 14.3s | 12.0s | −16% |
+| 2x TTFT p50/p99/max | 5.77/16.63/19.66 | 5.44/13.91/15.06 | −6%/−16%/−23% |
+| 2x 峰值 15s 桶服务率 | 67,888 | 77,193 | **+13.7%** |
+
+### 读数
+
+- 两侧全部负载 512/512 零失败、prompt 全匹配；两侧 knee 均未触达（2x 排空仅 12-14s）
+- **AFD 的核心优势在尾部与突发吸收**：2x 档 45-75s 高压期 AFD 持续服务率 75-77K vs baseline 67-68K（+13.7%）；排空时间全档短 16-43%；TTFT 尾部全档更优
+- baseline 内部 mbt=8192 → 63K 长请求 ≥8 步 chunk，突发桶内排队更深（2x 档 30-45s 桶供给 93.2K，baseline 完成 65.7K 且下一桶仍只有 67.9K；AFD 62.7K 后迅速以 77.2K 追平）
+- 1.5x 档 baseline p50 反而更好（3.42 vs 4.45）——轻载时小 chunk 起步更快，但尾部仍 AFD 优
+- 注意口径：baseline 按用户指定跑 mbt=8192；AFD 取其扫描最优格 65536（AFD@8192 只有 25.1K，更差）
+
+### 本次新坑（已修）
+
+1. **exec 嵌套引号 + 花括号展开**：`bash -c "bash -c '... ADDITIONAL_CONFIG={json} ...'"` 里 JSON 的花括号在远程解析层被 brace expansion 拆碎（VllmConfig ValidationError: input_value='multistream_dsv4_dsa_overlap:false'）。修法 = 启动器内置具名 preset（`ADDITIONAL_CONFIG=cws`），裸 JSON 不过 exec 边界
+2. **崩溃签名误报**：baseline 正常启动日志含 "Free memory X/61 GiB"（KV 预算 INFO 行），崩溃 grep 里的 `Free memory` 模式误杀。改用精确模式 `less than desired`
+3. 路由自测脚本（mock 双后端）必须先验证：选路正确性 + SSE 透传首 chunk <1ms（不缓冲）——本次抓到 rel_url 拼接 bug（yarl URL 不能直接 + str）
+
+### 归档
+
+- 本地：`bench_results/dsv4_afd_flash_xnode32/baseline2x/base2x_mbt8192_{1x,fast1p5x,fast2x}.json`
+- NAS：`shwstone/xnode32_baseline2x/`（3 JSON + 两侧实例日志 + router 日志 + 路由决策 jsonl）
