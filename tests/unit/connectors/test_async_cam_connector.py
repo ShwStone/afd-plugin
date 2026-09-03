@@ -269,6 +269,40 @@ def test_async_connector_uses_attn_ranks_per_dp_for_cam_tp_size():
     assert connector.tp_size == 4
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({"attn_ranks_per_dp": 4}, 8),  # default: request split, full mbt
+        (
+            {"attn_ranks_per_dp": 4, "async_moe_ubatching": True},
+            8,  # ubatching alone (request split) keeps full mbt
+        ),
+        (
+            {
+                "attn_ranks_per_dp": 4,
+                "async_moe_ubatching": True,
+                "async_moe_split": "token",
+            },
+            8 // 2 + 4,  # token split: ceil(mbt/2) + tp_size slack
+        ),
+        (
+            {"attn_ranks_per_dp": 4, "async_moe_split": "token"},
+            8,  # token split without ubatching keeps full mbt
+        ),
+    ],
+)
+def test_async_connector_token_split_halves_cam_capacity(extra, expected):
+    connector = CAMAsyncAFDConnector(
+        0,
+        0,
+        _vllm_config(extra_config=extra),
+        _afd_config(role="attention"),
+        0,
+    )
+
+    assert connector.max_seq_len == expected
+
+
 @pytest.mark.parametrize("value", [True, "bad"])
 def test_async_connector_rejects_invalid_attn_ranks_per_dp(value):
     with pytest.raises(TypeError, match="attn_ranks_per_dp"):

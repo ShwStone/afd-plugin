@@ -311,6 +311,17 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         self.max_seq_len = vllm_config.scheduler_config.max_num_batched_tokens
         self.comm_id = CAM_COMM_ID
         self.tp_size = extra_info.attn_ranks_per_dp
+        if (
+            extra_info.async_moe_ubatching
+            and extra_info.async_moe_split == ASYNC_MOE_TOKEN_SPLIT
+        ):
+            # Token-split balances the two ubatch stages by token count, so no
+            # single CAM dispatch/combine call ever carries more than
+            # ceil(mbt / 2) tokens (plus at most tp_size-1 SP alignment
+            # padding).  Size the operator capacity for the per-stage maximum
+            # instead of the full batch: this halves the CAM tiling workspace
+            # (mbt=131072 token-split tiles like mbt=65536 request-split).
+            self.max_seq_len = -(-self.max_seq_len // 2) + self.tp_size
         self.cam_pg: ProcessGroup | None = None
         self.topology = build_async_topology(
             afd_config,
