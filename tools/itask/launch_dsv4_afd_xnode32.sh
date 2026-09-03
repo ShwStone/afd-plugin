@@ -150,12 +150,18 @@ else
   MODEL_NAME=dsv4-afd-ffn
 fi
 
-CONNECTOR_EXTRA='"dynamicQuant":1,"attn_ranks_per_dp":4,"async_moe_ubatching":true'
+CONNECTOR_EXTRA='"dynamicQuant":1,"attn_ranks_per_dp":4,"async_moe_ubatching":'"${ASYNC_MOE_UBATCHING:-true}"',"async_moe_split":"'"${ASYNC_MOE_SPLIT:-request}"'"'
 CWS_PREFIX='"enable_force_load_balance":false'
 if [[ "$DSV4_SHARED_COMPRESSOR_WORKSPACE" == "1" ]]; then
   CWS_PREFIX='"enable_force_load_balance":false,"multistream_dsv4_dsa_overlap":false,"enable_dsv4_shared_compressor_workspace":true'
 fi
-ADDITIONAL_CONFIG="{$CWS_PREFIX,\"afd\":{\"role\":\"$ROLE\",\"connector\":\"CAMAsyncAFDConnector\",\"async\":true,\"host\":\"$NODE1_IP\",\"port\":1239,\"num_attention_ranks\":24,\"num_ffn_ranks\":8,\"compute_gate_on_attention\":true,\"connector_extra_config\":{$CONNECTOR_EXTRA}}}"
+# Opt-in async Attention DPLB policy (request_count|prefill_token_sum).
+# Attention-only: the plugin validator rejects this key on the FFN role.
+DPLB_KV=''
+if [[ "$ROLE" == "attention" && -n "${ATTN_DPLB_POLICY:-}" ]]; then
+  DPLB_KV=',"attention_dplb_policy":"'"$ATTN_DPLB_POLICY"'"'
+fi
+ADDITIONAL_CONFIG="{$CWS_PREFIX,\"afd\":{\"role\":\"$ROLE\",\"connector\":\"CAMAsyncAFDConnector\",\"async\":true,\"host\":\"$NODE1_IP\",\"port\":1239,\"num_attention_ranks\":24,\"num_ffn_ranks\":8,\"compute_gate_on_attention\":true${DPLB_KV},\"connector_extra_config\":{$CONNECTOR_EXTRA}}}"
 
 SCHEDULING_ARGS=(--enable-chunked-prefill)
 if [[ "$ASYNC_SCHEDULING" != "1" ]]; then

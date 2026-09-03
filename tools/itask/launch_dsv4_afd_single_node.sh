@@ -36,6 +36,13 @@ if [[ "$ROLE" == attention ]]; then API_PORT=$ATTN_API_PORT; else API_PORT=$FFN_
 # The upstream gate also requires multistream_dsv4_dsa_overlap=false, eager
 # mode, prefix caching off, no kv_transfer_config, no speculative, CP=1.
 : "${DSV4_SHARED_COMPRESSOR_WORKSPACE:=0}"
+# Async MoE ubatch split mode: "request" (request boundaries) or "token"
+# (token-balanced stages). ASYNC_MOE_UBATCHING=false disables ubatching.
+: "${ASYNC_MOE_UBATCHING:=true}"
+: "${ASYNC_MOE_SPLIT:=request}"
+# FlashComm1 (SP) is attention-only: FFN runs TP1 where Flash Comm v1 is
+# rejected by config validation.
+: "${FLASHCOMM1:=0}"
 # DSV4-Flash-w8a8-mtp; override when the task mounts the weights elsewhere.
 : "${MODEL_PATH:=/mnt/sfs_turbo/models/DeepSeek-V4-Flash-w8a8-mtp}"
 
@@ -106,7 +113,11 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_CONNECT_TIMEOUT=1800 HCCL_EXEC_TIMEOUT=1800
 export OMP_PROC_BIND=false OMP_NUM_THREADS=10
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
+if [[ "$ROLE" == attention ]]; then
+  export VLLM_ASCEND_ENABLE_FLASHCOMM1="$FLASHCOMM1"
+else
+  export VLLM_ASCEND_ENABLE_FLASHCOMM1=0
+fi
 
 if [[ "$ROLE" == attention ]]; then
   export ASCEND_RT_VISIBLE_DEVICES="$ATTENTION_DEVICES"
@@ -124,7 +135,7 @@ else
   API_SERVER_ARGS=(--api-server-count 1)
 fi
 
-CONNECTOR_EXTRA='"dynamicQuant":1,"attn_ranks_per_dp":4,"async_moe_ubatching":true'
+CONNECTOR_EXTRA='"dynamicQuant":1,"attn_ranks_per_dp":4,"async_moe_ubatching":'"$ASYNC_MOE_UBATCHING"',"async_moe_split":"'"$ASYNC_MOE_SPLIT"'"'
 if [[ -n "$CONNECTOR_HCCL_BUFFER_SIZE_MB" ]]; then
   CONNECTOR_EXTRA="$CONNECTOR_EXTRA,\"hccl_buffer_size\":$CONNECTOR_HCCL_BUFFER_SIZE_MB"
 fi
