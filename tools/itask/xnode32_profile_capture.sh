@@ -102,8 +102,8 @@ EXPORT_OK=0
 for i in $(seq 1 40); do
   sleep 30
   N1=$($S "$MASTER" -- bash -c "ls -d $PROFROOT/afd_attention_node1_ops/*_ascend_pt 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r' | tail -1)
-  N2=$($S "$SECOND" -- bash -c "ls -d $PROFROOT/afd_attention_node2_ops/*_ascend_pt 2>/dev/null | wc -l; ls -d $PROFROOT/afd_ffn_node1_ops/*_ascend_pt 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r' | tail -2 | tr '\n' ' ')
-  A2=${N2% *}; F2=${N2#* }
+  N2=$($S "$SECOND" -- bash -c "ls -d $PROFROOT/afd_attention_node2_ops/*_ascend_pt 2>/dev/null | wc -l; ls -d $PROFROOT/afd_ffn_node1_ops/*_ascend_pt 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r' | grep -o '[0-9]*' | tr '\n' ' ')
+  A2=$(echo "$N2" | awk '{print $1}'); F2=$(echo "$N2" | awk '{print $2}')
   say "  poll $i: attn1=${N1:-0}/16 attn2=${A2:-0}/8 ffn=${F2:-0}/8"
   if [[ "${N1:-0}" == 16 && "${A2:-0}" == 8 && "${F2:-0}" == 8 ]]; then
     STOPS=$($S "$MASTER" -- bash -c "cat /tmp/${TAG}_stop_attn.out 2>/dev/null" 2>/dev/null | tr -d '\r' | tail -1)
