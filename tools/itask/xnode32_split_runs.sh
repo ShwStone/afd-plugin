@@ -17,7 +17,8 @@ CODE=/a3_inference/itask/workdir/tq02357756/shwstone/code/afd-plugin
 LAUNCHER=$CODE/tools/itask/launch_dsv4_afd_xnode32.sh
 WL=$CODE/tools/datasets/moonconv-wildchat-v4-flash-prefill/workloads
 NASDIR=/a3_inference/itask/workdir/tq02357756/shwstone/xnode32_split_as
-TAG=xnode32_${SPLIT}_as_mbt65536
+MBT=${MBT:-65536}
+TAG=xnode32_${SPLIT}_as_mbt${MBT}
 
 X="timeout --signal=KILL 120 itask exec"
 S="timeout --signal=KILL 45 itask exec"
@@ -37,8 +38,8 @@ say "== cleanup both pods =="
 $S "$MASTER" -- bash /tmp/xnode32_cleanup.sh 2>&1 | tr -d '\r' | tail -2
 $S "$SECOND" -- bash /tmp/xnode32_cleanup.sh 2>&1 | tr -d '\r' | tail -2
 
-ENV1="NODE1_IP=$NODE1_IP NODE2_IP=$NODE2_IP MAX_NUM_BATCHED_TOKENS=65536 HCCL_BUFFSIZE=4096 FLASHCOMM1=1 $SPLENV"
-say "== start stack (mbt=65536, HCCL_BUFFSIZE=4096, $SPLENV) =="
+ENV1="NODE1_IP=$NODE1_IP NODE2_IP=$NODE2_IP MAX_NUM_BATCHED_TOKENS=$MBT HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-4096} FLASHCOMM1=1 $SPLENV ${EXTRA_ENV:-}"
+say "== start stack (mbt=$MBT, HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-4096}, $SPLENV) =="
 $S "$MASTER" -- bash -c "setsid bash -c 'env $ENV1 NODE_IP=$NODE1_IP ROLE=attention ATTENTION_NODE_ID=1 nohup bash $LAUNCHER > /tmp/${TAG}_attn1.log 2>&1 &' ; echo started" 2>&1 | tr -d '\r' | tail -1
 $S "$SECOND" -- bash -c "setsid bash -c 'env $ENV1 NODE_IP=$NODE2_IP ROLE=attention ATTENTION_NODE_ID=2 nohup bash $LAUNCHER > /tmp/${TAG}_attn2.log 2>&1 &' ; echo started" 2>&1 | tr -d '\r' | tail -1
 # Stagger FFN behind headless attention on node2: both vllm instances race
