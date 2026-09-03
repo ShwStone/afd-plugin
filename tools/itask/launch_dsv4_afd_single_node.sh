@@ -31,7 +31,7 @@ if [[ "$ROLE" == attention ]]; then API_PORT=$ATTN_API_PORT; else API_PORT=$FFN_
 : "${MAX_NUM_BATCHED_TOKENS:=10240}"
 : "${MAX_NUM_SEQS:=128}"
 : "${MAX_MODEL_LEN:=70000}"
-: "${ASYNC_SCHEDULING:=0}"
+: "${ASYNC_SCHEDULING:=1}"  # default ON since 2026-09-03 (user directive); set 0 to force --no-async-scheduling
 # Opt into the DeepSeek-V4 shared compressor workspace (cache_mode=2 CYCLE).
 # The upstream gate also requires multistream_dsv4_dsa_overlap=false, eager
 # mode, prefix caching off, no kv_transfer_config, no speculative, CP=1.

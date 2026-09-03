@@ -49,7 +49,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-70000}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-32768}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.80}"
-ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
+ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-1}"  # default ON since 2026-09-03 (user directive); NOTE: doubles in-flight KV budget, watch mbt=65536 estimate
 PORT="${PORT:-8000}"
 
 # Load the Ascend runtime environment (non-interactive shells skip .bashrc).

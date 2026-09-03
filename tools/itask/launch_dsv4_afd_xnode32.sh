@@ -27,7 +27,7 @@ if [[ "$ROLE" == attention ]]; then API_PORT=$ATTN_API_PORT; else API_PORT=$FFN_
 : "${MAX_NUM_BATCHED_TOKENS:=8192}"
 : "${MAX_NUM_SEQS:=128}"
 : "${MAX_MODEL_LEN:=70000}"
-: "${ASYNC_SCHEDULING:=0}"
+: "${ASYNC_SCHEDULING:=1}"  # default ON since 2026-09-03 (user directive); set 0 to force --no-async-scheduling
 # Shared compressor workspace (CWS, cache_mode=2 CYCLE) is required for
 # mbt=65536 to pass the startup KV estimate and is kept on for all sweep
 # cells so mbt is the only varying knob.  vllm-ascend must be e19e14da7.
