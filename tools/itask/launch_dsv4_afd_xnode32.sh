@@ -63,17 +63,19 @@ if [[ "$ROLE" == attention ]]; then
   esac
 fi
 
+# Profiling is request-controlled (vLLM /start_profile + /stop_profile);
+# iteration schedules are rejected by validate_afd_profiler_config.
 case "$PROFILE_VARIANT" in
   none)
     PROFILER_ARGS=()
     ;;
   full)
     PROFILE_DIR="$PROFILE_ROOT/afd_${ROLE}_node${ATTENTION_NODE_ID}_full"
-    PROFILER_ARGS=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFILE_DIR\",\"torch_profiler_with_stack\":true,\"torch_profiler_record_shapes\":true,\"torch_profiler_with_memory\":false,\"torch_profiler_use_gzip\":false,\"ignore_frontend\":true,\"delay_iterations\":10,\"max_iterations\":9,\"warmup_iterations\":0,\"active_iterations\":10,\"wait_iterations\":0}")
+    PROFILER_ARGS=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFILE_DIR\",\"torch_profiler_with_stack\":true,\"torch_profiler_record_shapes\":true,\"torch_profiler_with_memory\":false,\"torch_profiler_use_gzip\":false,\"ignore_frontend\":true}")
     ;;
   ops)
     PROFILE_DIR="$PROFILE_ROOT/afd_${ROLE}_node${ATTENTION_NODE_ID}_ops"
-    PROFILER_ARGS=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFILE_DIR\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":false,\"torch_profiler_with_memory\":false,\"torch_profiler_use_gzip\":false,\"ignore_frontend\":true,\"delay_iterations\":10,\"max_iterations\":9,\"warmup_iterations\":0,\"active_iterations\":10,\"wait_iterations\":0}")
+    PROFILER_ARGS=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFILE_DIR\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":false,\"torch_profiler_with_memory\":false,\"torch_profiler_use_gzip\":false,\"ignore_frontend\":true}")
     ;;
   *)
     echo "PROFILE_VARIANT must be none, full, or ops" >&2
