@@ -283,7 +283,7 @@ def test_async_connector_uses_attn_ranks_per_dp_for_cam_tp_size():
                 "async_moe_ubatching": True,
                 "async_moe_split": "token",
             },
-            8 // 2 + 4,  # token split: ceil(mbt/2) + tp_size slack
+            8 // 2,  # token split: exactly ceil(mbt/2), no slack
         ),
         (
             {"attn_ranks_per_dp": 4, "async_moe_split": "token"},

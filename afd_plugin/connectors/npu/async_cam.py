@@ -317,11 +317,13 @@ class CAMAsyncAFDConnector(AFDConnectorBase):
         ):
             # Token-split balances the two ubatch stages by token count, so no
             # single CAM dispatch/combine call ever carries more than
-            # ceil(mbt / 2) tokens (plus at most tp_size-1 SP alignment
-            # padding).  Size the operator capacity for the per-stage maximum
-            # instead of the full batch: this halves the CAM tiling workspace
-            # (mbt=131072 token-split tiles like mbt=65536 request-split).
-            self.max_seq_len = -(-self.max_seq_len // 2) + self.tp_size
+            # ceil(mbt / 2) tokens.  SP alignment padding cannot cross this
+            # bound: when ceil(mbt/2) is TP-divisible (true for the swept
+            # power-of-two mbt values) the maximum stage needs no padding.
+            # Keep the halved capacity exactly ceil(mbt / 2) — the CAM
+            # operator tiling relies on aligned capacities (an unaligned
+            # 65540 faulted with 507015 DDR out-of-range on the first recv).
+            self.max_seq_len = -(-self.max_seq_len // 2)
         self.cam_pg: ProcessGroup | None = None
         self.topology = build_async_topology(
             afd_config,
