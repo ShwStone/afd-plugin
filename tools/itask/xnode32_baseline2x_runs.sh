@@ -5,7 +5,7 @@
 # Usage: xnode32_baseline2x_runs.sh
 #
 # Config parity with the AFD xnode32 runs: same vllm-ascend (e19e14da7) with
-# CWS on, FLASHCOMM1=1, util 0.80, no async-scheduling, no HCCL_BUFFSIZE.
+# CWS on, FLASHCOMM1=1, util 0.80, async-scheduling ON (2026-09-03 directive), no HCCL_BUFFSIZE.
 # Baseline-specific (per user): mbt=8192, stock serving (no AFD plugin).
 set -uo pipefail
 
@@ -18,9 +18,9 @@ BASE_LAUNCHER=$CODE/tools/benchmarks/v4_launch_baseline.sh
 ROUTER=$CODE/tools/benchmarks/least_load_router.py
 PY=/usr/local/python3.12.13/bin/python3
 WL=$CODE/tools/datasets/moonconv-wildchat-v4-flash-prefill/workloads
-NASDIR=/a3_inference/itask/workdir/tq02357756/shwstone/xnode32_baseline2x
+NASDIR=/a3_inference/itask/workdir/tq02357756/shwstone/xnode32_baseline2x_as
 MBT=${MBT:-8192}
-TAG=base2x_mbt${MBT}
+TAG=base2x_as_mbt${MBT}
 ROUTER_PORT=8800
 
 X="timeout --signal=KILL 120 itask exec"
