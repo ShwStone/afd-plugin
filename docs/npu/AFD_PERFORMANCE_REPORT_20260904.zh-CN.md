@@ -24,14 +24,17 @@
 
 ## 3. 摘要：最重要的性能提升
 
-- **单机 16 卡，AFD（DP4TP2+DP8EP8, mbt=65536）vs 同卡数最优 baseline（mbt=32768, async ON）**：
-  - 有效吞吐 **1x +4.7%、1.25x +6.6%、1.5x +8.6%**（1.5x：40,096 vs 36,925 tok/s）；
-  - **TTFT p99 @1x −28%**（15.6 vs 21.8s），p50 减半（4.7 vs 11.2s）；
-  - **10s TTFT SLO 达成率 @1x 85.2% vs 34.0%（+51.2pp）**。
-- **双机 32 卡**：DP6TP4 AFD（token-split）对 2×DP4TP4 baseline 最优档 **2x 有效吞吐 +6.8%**（61.6K vs 57.7K）。
+- **单机 16 卡，AFD（DP4TP2+DP8EP8, mbt=65536）vs 逐点最优 baseline**（async ON;每个速率点取
+  mbt 8192/32768 中更优者，与图中竖虚线标注同口径）：
+  - 有效吞吐 **1x +4.8%、1.25x +6.6%、1.5x +8.6%**（1.5x：40,096 vs 36,925 tok/s）；
+  - **TTFT p99 @1x −22.1%**（15.6 vs 20.0s，该点最优为 8192 档），p50 −37.4%（4.7 vs 7.4s）；
+  - **10s TTFT SLO 达成率 @1x 85.2% vs 65.2%（+20.0pp）**（32768 档为 34.0%，差距 +51.2pp）。
+- **双机 32 卡**：DP6TP4 AFD（token-split）对逐点最优 baseline2x **2x 有效吞吐 +6.8%**（61.6K vs 57.7K，该点最优为 8192 档）。
 - **实例级扩展（2×16 卡 AFD 实例 + router）**：2x 有效吞吐 **62,993 tok/s**——对 DP6TP4-token
-  **+2.2%**、DP6TP4-request **+7.0%**、双实例 baseline-8k **+9.2%**、baseline-32k **+16.4%**；
-  且 2x TTFT p50 **−34%**（4.17 vs 6.31s）、10s SLO +4.9pp。router 分流实测 766:772，无限流损耗。
+  **+2.2%**、DP6TP4-request **+7.0%**、**逐点最优 baseline2x +9.2%**（各点最优均为 8192 档：
+  1x/1.5x/2x 分别 +2.0%/+4.3%/+9.2%；32768 档 +16.4%）；
+  2x TTFT p50 对 DP6TP4 **−34%**（4.17 vs 6.31s）、对逐点最优 baseline2x −30.1%；10s SLO 对
+  逐点最优 baseline **+12.9pp**。router 分流实测 766:772，无限流损耗。
 - 负面对照：DP3TP8 布局 2x 吞吐 −22.5%（引擎数减半的排队代价）；DP8TP2 baseline 装不下
   mbt=32768（运行时 NPU OOM）。
 
@@ -53,31 +56,33 @@ mbt=65536 单 chunk prefill 是 p50 优势的主要来源。baseline-8k 低速�
 
 ![单机 p99](../../bench_results/dsv4_afd_flash_xnode32/svg_20260904/singlenode_p99.svg)
 
-AFD token-split 的 p99 从 9.0s 缓慢爬到 34.3s；baseline-32k 同路径 18.8→36.6s，1x 处
-**−28%**。低速率下 ~10s 尾是 63K 长 prompt 单请求的固有 prefill 延迟，非排队——AFD 把
-排队分量压到了固有值附近。
+AFD token-split 的 p99 从 9.0s 缓慢爬到 34.3s。对逐点最优 baseline（低速率 8k、1.25x 起
+32k）差距稳定在 **−19%~−22%**（1x 处 15.6 vs 20.0s）。低速率下 ~10s 尾是 63K 长 prompt
+单请求的固有 prefill 延迟，非排队——AFD 把排队分量压到了固有值附近。
 
 ### 4.3 有效吞吐
 
 ![单机 eff](../../bench_results/dsv4_afd_flash_xnode32/svg_20260904/singlenode_eff.svg)
 
-次满载档四条线重合（都跟供给走）；**1x 之后分层**：AFD token 最高（1x +4.7% → 1.5x
-+8.6%），baseline-8k 唯一往下掉（1.5x 只有供给的 59%）。AFD 的持续容量 ≈38–40K、
-baseline ≈37K（16 卡）。
+次满载档四条线重合（都跟供给走）；**1x 之后分层**：AFD token 最高（对逐点最优 baseline
+1x **+4.8%** → 1.5x **+8.6%**），baseline-8k 唯一往下掉（1.5x 只有供给的 59%）。AFD 的
+持续容量 ≈38–40K、baseline ≈37K（16 卡）。
 
 ### 4.4 峰值 15s 服务速率
 
 ![单机 peak](../../bench_results/dsv4_afd_flash_xnode32/svg_20260904/singlenode_peak.svg)
 
-瞬时爆发是平手（AFD 44–47K vs baseline 43–46K）：baseline 靠堆 chunk 冲峰，AFD 的
-ubatch 流水把输出抹平。**AFD 的赢面在持续速率和 TTFT 尾，不在爆发**。
+对逐点最优 baseline，峰值桶 0.5x–1x 落后 1~5%，1.25x 起反超 **+2.7~3.0%**：baseline 靠
+堆 chunk 冲峰（32k 档 1.5x 峰值 45.4K），AFD 的 ubatch 流水把输出抹平。**AFD 的赢面在
+持续速率和 TTFT 尾，不在爆发**。
 
 ### 4.5 10s TTFT SLO 达成率
 
 ![单机 SLO](../../bench_results/dsv4_afd_flash_xnode32/svg_20260904/singlenode_slo10.svg)
 
-分离度最大的一张：1x 处 **AFD 85.2% vs baseline-32k 34.0%（+51.2pp）**。baseline-8k
-低速能跟 AFD 打（98% 级）但 0.75x 后自由落体——窄 mbt 的调度劣化直接打进 SLO。
+分离度最大的一张：1x 处 **AFD 85.2% vs 逐点最优 baseline（8192 档）65.2%，+20.0pp**
+（若对 32768 档则 34.0%、+51.2pp——8k 靠窄 mbt 在低速率保住 SLO，0.75x 后自由落体）。
+超载档差距收敛到 +6.6~+7.8pp（1.25x：44.3% vs 37.7%）。
 
 ## 5. 实例级扩展：2×16 卡 AFD 实例 vs 双机
 
@@ -100,9 +105,10 @@ ubatch 流水把输出抹平。**AFD 的赢面在持续速率和 TTFT 尾，不�
 ![双实例 eff](../../bench_results/dsv4_afd_flash_xnode32/svg_20260904/twoinst_eff.svg)
 
 1x/1.5x 各方案在供给线附近重合（供给受限）；**2x 满负荷分层**：2×实例 **63.0K** >
-DP6TP4-token 61.6K（+2.2%）> DP6TP4-request 58.9K（+7.0%）> baseline2x-8k 57.7K
-（+9.2%）> baseline2x-32k 54.1K（+16.4%）。两个 16 卡小实例 + 实例间均衡 ≥ 一个
-32 卡双机实例——且 router 分流 766:772 几乎完美，无代理损耗。
+DP6TP4-token 61.6K（+2.2%）> DP6TP4-request 58.9K（+7.0%）> baseline2x。对逐点最优
+baseline2x（各速率点均为 8192 档）**1x +2.0%、1.5x +4.3%、2x +9.2%**（32768 档 2x 为
++16.4%）。两个 16 卡小实例 + 实例间均衡 ≥ 一个 32 卡双机实例——且 router 分流
+766:772 几乎完美，无代理损耗。
 
 ### 5.4 峰值 15s 服务速率
 
