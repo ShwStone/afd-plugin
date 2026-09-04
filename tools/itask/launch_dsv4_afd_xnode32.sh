@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Two-task 32-card DSV4 async CAM deployment for the mbt sweep
-# (DP6TP4 attention + DP8EP8 FFN).
+# Two-task 32-card DSV4 async CAM deployment for the mbt sweep.
 #
-# Attention is one global DP6TP4 vLLM process group, started once on each
-# node: node1 (master) owns DP0-3 (NPUs 0-15) and hosts the API; node2 owns
-# DP4-5 (NPUs 0-7) and joins headlessly.  Both Attention invocations use
-# node1 as the vLLM DP coordinator.  All 24 Attention ranks and 8 FFN ranks
-# join one CAM communicator through node1; node2 also hosts the FFN DP8/EP8
-# ranks on NPUs 8-15 (started as a second invocation with ROLE=ffn).
+# Attention is one global DPxTP vLLM process group (24 ranks), started once on
+# each node, layout selected by ATTN_LAYOUT:
+#   dp6tp4 (default): node1 owns DP0-3 (NPUs 0-15) + API; node2 owns DP4-5
+#                     (NPUs 0-7) headless.
+#   dp3tp8:           node1 owns DP0-1 (NPUs 0-15) + API; node2 owns DP2
+#                     (NPUs 0-7) headless.
+# Both Attention invocations use node1 as the vLLM DP coordinator.  All 24
+# Attention ranks and 8 FFN ranks join one CAM communicator through node1;
+# node2 also hosts the FFN DP8/EP8 ranks on NPUs 8-15 (started as a second
+# invocation with ROLE=ffn).
 : "${ROLE:?ROLE must be attention or ffn}"
 : "${NODE_IP:?NODE_IP is required (this pod IP)}"
-: "${ATTENTION_NODE_ID:=1}"  # 1 = node1 master (DP0-3), 2 = node2 (DP4-5)
+: "${ATTENTION_NODE_ID:=1}"  # 1 = node1 master (API), 2 = node2 (headless)
+: "${ATTN_LAYOUT:=dp6tp4}"   # dp6tp4 | dp3tp8
 : "${ATTN_API_PORT:=8900}"
 : "${FFN_API_PORT:=8901}"
 if [[ "$ROLE" == attention ]]; then API_PORT=$ATTN_API_PORT; else API_PORT=$FFN_API_PORT; fi
@@ -40,18 +44,26 @@ case "$ROLE" in
   *) echo "ROLE must be attention or ffn" >&2; exit 2 ;;
 esac
 
+# Layout resolution (applies to both roles: the FFN connector also needs
+# attn_ranks_per_dp to describe the attention topology).
+case "$ATTN_LAYOUT" in
+  dp6tp4) ATTN_DP_SIZE=6; ATTN_TP_SIZE=4; ATTN_N1_LOCAL=4; ATTN_N2_LOCAL=2; ATTN_N2_START=4 ;;
+  dp3tp8) ATTN_DP_SIZE=3; ATTN_TP_SIZE=8; ATTN_N1_LOCAL=2; ATTN_N2_LOCAL=1; ATTN_N2_START=2 ;;
+  *) echo "ATTN_LAYOUT must be dp6tp4 or dp3tp8" >&2; exit 2 ;;
+esac
+
 if [[ "$ROLE" == attention ]]; then
   case "$ATTENTION_NODE_ID" in
     1)
-      ATTN_DP_SIZE_LOCAL=4
+      ATTN_DP_SIZE_LOCAL=$ATTN_N1_LOCAL
       ATTN_DP_START_RANK=0
       ATTN_HEADLESS_ARGS=()
       ATTN_DEVICES="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
       API_SERVER_ARGS=(--api-server-count 1)
       ;;
     2)
-      ATTN_DP_SIZE_LOCAL=2
-      ATTN_DP_START_RANK=4
+      ATTN_DP_SIZE_LOCAL=$ATTN_N2_LOCAL
+      ATTN_DP_START_RANK=$ATTN_N2_START
       ATTN_HEADLESS_ARGS=(--headless)
       ATTN_DEVICES="0,1,2,3,4,5,6,7"
       API_SERVER_ARGS=()
@@ -132,14 +144,14 @@ fi
 
 if [[ "$ROLE" == attention ]]; then
   export ASCEND_RT_VISIBLE_DEVICES="$ATTN_DEVICES"
-  # One global DP6TP4 group: node1 DP0-3 + node2 DP4-5, coordinator on node1.
+  # One global attention DP group (layout per ATTN_LAYOUT), coordinator on node1.
   PARALLEL_ARGS=(
-    --data-parallel-size 6
+    --data-parallel-size "$ATTN_DP_SIZE"
     --data-parallel-size-local "$ATTN_DP_SIZE_LOCAL"
     --data-parallel-start-rank "$ATTN_DP_START_RANK"
     --data-parallel-address "$NODE1_IP"
     --data-parallel-rpc-port "$DP_RPC_PORT"
-    --tensor-parallel-size 4
+    --tensor-parallel-size "$ATTN_TP_SIZE"
     "${ATTN_HEADLESS_ARGS[@]}"
   )
   WORKER=afd_plugin.v1.worker.npu.AFDNPUAttentionWorker
@@ -152,7 +164,7 @@ else
   MODEL_NAME=dsv4-afd-ffn
 fi
 
-CONNECTOR_EXTRA='"dynamicQuant":1,"attn_ranks_per_dp":4,"async_moe_ubatching":'"${ASYNC_MOE_UBATCHING:-true}"',"async_moe_split":"'"${ASYNC_MOE_SPLIT:-request}"'"'
+CONNECTOR_EXTRA='"dynamicQuant":1,"attn_ranks_per_dp":'"$ATTN_TP_SIZE"',"async_moe_ubatching":'"${ASYNC_MOE_UBATCHING:-true}"',"async_moe_split":"'"${ASYNC_MOE_SPLIT:-request}"'"'
 CWS_PREFIX='"enable_force_load_balance":false'
 if [[ "$DSV4_SHARED_COMPRESSOR_WORKSPACE" == "1" ]]; then
   CWS_PREFIX='"enable_force_load_balance":false,"multistream_dsv4_dsa_overlap":false,"enable_dsv4_shared_compressor_workspace":true'
