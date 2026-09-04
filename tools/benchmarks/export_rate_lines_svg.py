@@ -23,7 +23,7 @@ BASE = TOOLS.parent.parent / "bench_results" / "dsv4_afd_flash_xnode32"
 OUT = BASE / "svg_20260904"
 
 W, H = 1280, 720
-PADL, PADR, PADT, PADB = 84, 28, 104, 66
+PADL, PADR, PADT, PADB = 94, 30, 112, 70
 
 CHARTS = [
     ("p50", "TTFT p50（s）", "s"),
@@ -102,21 +102,21 @@ def render_chart(payload: dict, keys: list, metric: str, title: str, unit: str) 
          f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
          f'viewBox="0 0 {W} {H}" font-family="-apple-system,\'Segoe UI\',sans-serif">',
          f'<rect width="{W}" height="{H}" fill="#ffffff"/>',
-         f'<text x="16" y="26" font-size="15" font-weight="600" fill="#111">{esc(title)}</text>']
+         f'<text x="16" y="30" font-size="20" font-weight="600" fill="#111">{esc(title)}</text>']
 
     # legend (wrap if narrow)
-    lx, ly = 16, 46
+    lx, ly = 16, 54
     for k in keys:
         label = payload["labels_map"][k]
         color = payload["colors"][payload["family"][k]]
         dash = ' stroke-dasharray="7 5"' if payload["dash"][k] else ""
-        est = 46 + len(label) * 7.2
+        est = 54 + len(label) * 8.8
         if lx + est > W - 20:
-            lx, ly = 16, ly + 20
-        s.append(f'<line x1="{lx}" y1="{ly}" x2="{lx+26}" y2="{ly}" stroke="{color}" '
-                 f'stroke-width="2"{dash}/>')
-        s.append(f'<circle cx="{lx+13}" cy="{ly}" r="3.4" fill="{color}"/>')
-        s.append(f'<text x="{lx+32}" y="{ly+4}" font-size="12" fill="#111">{esc(label)}</text>')
+            lx, ly = 16, ly + 24
+        s.append(f'<line x1="{lx}" y1="{ly}" x2="{lx+32}" y2="{ly}" stroke="{color}" '
+                 f'stroke-width="2.5"{dash}/>')
+        s.append(f'<circle cx="{lx+16}" cy="{ly}" r="4.2" fill="{color}"/>')
+        s.append(f'<text x="{lx+40}" y="{ly+5}" font-size="15" fill="#111">{esc(label)}</text>')
         lx += est
     top = PADT if ly < 60 else PADT + 20
 
@@ -124,30 +124,30 @@ def render_chart(payload: dict, keys: list, metric: str, title: str, unit: str) 
     for tv in ticks:
         y = Y(tv)
         s.append(f'<line x1="{PADL}" y1="{y:.1f}" x2="{W-PADR}" y2="{y:.1f}" stroke="#eee"/>')
-        s.append(f'<text x="{PADL-8}" y="{y+4:.1f}" font-size="11" fill="#555" '
+        s.append(f'<text x="{PADL-9}" y="{y+5:.1f}" font-size="14" fill="#555" '
                  f'text-anchor="end">{yfmt_axis(metric, tv)}</text>')
     # axes
     s.append(f'<line x1="{PADL}" y1="{top}" x2="{PADL}" y2="{H-PADB}" stroke="#999"/>')
     s.append(f'<line x1="{PADL}" y1="{H-PADB}" x2="{W-PADR}" y2="{H-PADB}" stroke="#999"/>')
     # x ticks (two-line label)
     for i, (lab, off) in enumerate(zip(labels, offered)):
-        s.append(f'<line x1="{xs[i]:.1f}" y1="{H-PADB}" x2="{xs[i]:.1f}" y2="{H-PADB+5}" stroke="#999"/>')
-        s.append(f'<text x="{xs[i]:.1f}" y="{H-PADB+20}" font-size="11" fill="#333" text-anchor="middle">'
-                 f'{esc(lab)}<tspan x="{xs[i]:.1f}" dy="13">{off/1000:.1f}K</tspan></text>')
-    s.append(f'<text x="{(PADL+W-PADR)/2:.0f}" y="{H-8}" font-size="11" fill="#555" text-anchor="middle">'
+        s.append(f'<line x1="{xs[i]:.1f}" y1="{H-PADB}" x2="{xs[i]:.1f}" y2="{H-PADB+6}" stroke="#999"/>')
+        s.append(f'<text x="{xs[i]:.1f}" y="{H-PADB+24}" font-size="14" fill="#333" text-anchor="middle">'
+                 f'{esc(lab)}<tspan x="{xs[i]:.1f}" dy="16">{off/1000:.1f}K</tspan></text>')
+    s.append(f'<text x="{(PADL+W-PADR)/2:.0f}" y="{H-8}" font-size="14" fill="#555" text-anchor="middle">'
              f'供给速率（tok/s）</text>')
-    s.append(f'<text x="14" y="{(top+H-PADB)/2:.0f}" font-size="11" fill="#555" '
-             f'text-anchor="middle" transform="rotate(-90 14 {(top+H-PADB)/2:.0f})">{esc(unit)}</text>')
+    s.append(f'<text x="16" y="{(top+H-PADB)/2:.0f}" font-size="14" fill="#555" '
+             f'text-anchor="middle" transform="rotate(-90 16 {(top+H-PADB)/2:.0f})">{esc(unit)}</text>')
 
     # series lines + points
     for k in keys:
         color = payload["colors"][payload["family"][k]]
         dash = ' stroke-dasharray="7 5"' if payload["dash"][k] else ""
         pts = " ".join(f"{xs[i]:.1f},{Y(c[metric]):.1f}" for i, c in enumerate(series[k]) if c)
-        s.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2"{dash}/>')
+        s.append(f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2.5"{dash}/>')
         for i, c in enumerate(series[k]):
             if c:
-                s.append(f'<circle cx="{xs[i]:.1f}" cy="{Y(c[metric]):.1f}" r="3.6" fill="{color}"/>')
+                s.append(f'<circle cx="{xs[i]:.1f}" cy="{Y(c[metric]):.1f}" r="4.2" fill="{color}"/>')
 
     # gap annotation: AFD token vs per-point best baseline
     akey = gap["afdKey"]
@@ -174,12 +174,12 @@ def render_chart(payload: dict, keys: list, metric: str, title: str, unit: str) 
         txt = f"Δ {'+' if diff >= 0 else '−'}{fmt_abs(metric, diff)}"
         if metric not in gap["noRel"]:
             txt += f" ({'+' if rel >= 0 else '−'}{abs(rel):.1f}%)"
-        w_est = len(txt) * 6.2 + 10
-        bx = xs[i] + 7 if xs[i] + 7 + w_est < W - PADR else xs[i] - 7 - w_est
-        my = min(max((ya + yb) / 2, top + 8), H - PADB - 8)
-        s.append(f'<rect x="{bx:.1f}" y="{my-9:.1f}" width="{w_est:.0f}" height="18" rx="3" '
+        w_est = len(txt) * 7.8 + 12
+        bx = xs[i] + 8 if xs[i] + 8 + w_est < W - PADR else xs[i] - 8 - w_est
+        my = min(max((ya + yb) / 2, top + 10), H - PADB - 10)
+        s.append(f'<rect x="{bx:.1f}" y="{my-11:.1f}" width="{w_est:.0f}" height="22" rx="4" '
                  f'fill="#ffffff" fill-opacity="0.9" stroke="#bbb"/>')
-        s.append(f'<text x="{bx+5:.1f}" y="{my+4:.1f}" font-size="10.5" fill="#111">{esc(txt)}</text>')
+        s.append(f'<text x="{bx+6:.1f}" y="{my+5:.1f}" font-size="13" fill="#111">{esc(txt)}</text>')
 
     s.append("</svg>")
     return "\n".join(s)
