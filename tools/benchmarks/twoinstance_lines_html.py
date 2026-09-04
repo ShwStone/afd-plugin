@@ -68,6 +68,10 @@ def main() -> None:
         "labels_map": LABELS_MAP,
         "family": FAMILY,
         "dash": DASH,
+        # gap annotation: 2-instance TP2 AFD token vs the per-point best baseline2x
+        "gap": {"afdKey": "inst2_tok", "baseKeys": ["base2x_8k", "base2x_32k"],
+                "better": {"p50": "low", "p99": "low", "eff": "high", "peak": "high", "slo10": "high"},
+                "noRel": ["slo10"]},
     }
     html = TEMPLATE.replace("__PAYLOAD__", json.dumps(out, separators=(",", ":")))
     dst = BASE / "line_charts_2instances_vs_dp6tp4.html"
@@ -99,7 +103,9 @@ TEMPLATE = r"""<!DOCTYPE html>
 <b style="color:#B7791F">橙 = DP6TP4+EP8 双机单实例</b> /
 <b style="color:#1e7d64">绿 = 2×DP4TP4EP16 baseline</b>），
 线型 = 配置（实线/虚线见 图例）。横轴为供给速率（tok/s）。
-router 分流实测 766:772。</div>
+router 分流实测 766:772。<br>
+<b>竖虚线标注</b> = 该速率点 2×DP4TP2 token 与“该点最优 baseline2x”的差距：Δ绝对值
+（相对差 %，以 baseline 为基；SLO 只标绝对差 pp）。</div>
 <div id="charts"></div>
 <script>
 const P = __PAYLOAD__;
@@ -112,6 +118,66 @@ const CHARTS = [
   { id: "slo10",title: "10s TTFT SLO 达成率（%）",    unit: "%",    yfmt: v => v.toFixed(0) },
 ];
 const wrap = document.getElementById("charts");
+function fmtAbs(metric, d) {
+  const ad = Math.abs(d);
+  if (metric === "slo10") return ad.toFixed(1) + "pp";
+  if (metric === "p50" || metric === "p99") return ad.toFixed(ad < 10 ? 2 : 1) + "s";
+  return (ad / 1000).toFixed(2) + "K";
+}
+function drawGapLabel(ctx, x, y, text, plotRight) {
+  ctx.save();
+  ctx.font = "10px sans-serif";
+  const w = ctx.measureText(text).width + 8, h = 16;
+  let lx = x + 7;
+  if (lx + w > plotRight - 4) lx = x - 7 - w;
+  ctx.globalAlpha = 0.88; ctx.fillStyle = "#fff"; ctx.strokeStyle = "#bbb";
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(lx, y - h / 2, w, h, 3); else ctx.rect(lx, y - h / 2, w, h);
+  ctx.fill(); ctx.stroke();
+  ctx.globalAlpha = 1; ctx.fillStyle = "#111";
+  ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText(text, lx + 4, y + 0.5);
+  ctx.restore();
+}
+function makeGapPlugin(metric) {
+  return {
+    id: "gap_" + metric,
+    afterDatasetsDraw(chart) {
+      const ai = KEYS.indexOf(P.gap.afdKey);
+      const meta = chart.getDatasetMeta(ai);
+      if (!meta || !meta.data || meta.data.length === 0) return;
+      const ctx = chart.ctx, ys = chart.scales.y;
+      const plotRight = chart.chartArea.right, top = chart.chartArea.top + 9,
+            bot = chart.chartArea.bottom - 9;
+      P.offered.forEach((_, i) => {
+        const a = P.series[P.gap.afdKey][i];
+        const pt = meta.data[i];
+        if (!a || !pt) return;
+        let base = null;
+        for (const bk of P.gap.baseKeys) {
+          const b = P.series[bk][i];
+          if (!b) continue;
+          if (!base || (P.gap.better[metric] === "high" ? b[metric] > base[metric]
+                                                        : b[metric] < base[metric])) base = b;
+        }
+        if (!base) return;
+        const diff = a[metric] - base[metric];
+        const rel = diff / base[metric] * 100;
+        const xa = pt.x, ya = pt.y, yb = ys.getPixelForValue(base[metric]);
+        ctx.save();
+        ctx.setLineDash([4, 4]); ctx.lineWidth = 1.2; ctx.strokeStyle = "#666";
+        ctx.beginPath(); ctx.moveTo(xa, ya); ctx.lineTo(xa, yb); ctx.stroke();
+        ctx.restore();
+        let txt = "Δ " + (diff >= 0 ? "+" : "−") + fmtAbs(metric, diff);
+        if (!P.gap.noRel.includes(metric)) {
+          txt += " (" + (rel >= 0 ? "+" : "−") + Math.abs(rel).toFixed(1) + "%)";
+        }
+        const my = Math.max(top, Math.min(bot, (ya + yb) / 2));
+        drawGapLabel(ctx, xa, my, txt, plotRight);
+      });
+    },
+  };
+}
 for (const c of CHARTS) {
   const panel = document.createElement("div");
   panel.className = "panel";
@@ -119,6 +185,7 @@ for (const c of CHARTS) {
   wrap.appendChild(panel);
   new Chart(document.getElementById(`cv_${c.id}`), {
     type: "line",
+    plugins: [makeGapPlugin(c.id)],
     data: {
       labels: P.offered,
       datasets: KEYS.map(k => ({
