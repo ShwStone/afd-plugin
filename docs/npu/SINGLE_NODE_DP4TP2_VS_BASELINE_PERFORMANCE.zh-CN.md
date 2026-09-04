@@ -33,6 +33,19 @@
 
 AFD request 0.5x–1x 三格来自 `dp4tp2_singlenode/`（同栈同参），1.25x/1.5x 为本轮补测。
 
+### 2.1 baseline 拓扑对照系列：DP8TP2（eff / 峰值桶 / p50 / p99 / 排空）
+
+| 速率 | base-DP8TP2-8192 | base-DP8TP2-32768 |
+|---|---|---|
+| 0.5x | 16,368 / 27.1K / 4.47 / 15.81 / 21.4s | ✗ 运行时 NPU OOM |
+| 0.75x | 24,062 / 36.6K / 5.96 / 23.04 / 18.6s | ✗ |
+| 1x | 29,127 / 41.0K / 8.68 / 30.49 / 30.6s | ✗ |
+| 1.25x | 33,888 / 49.8K / 14.04 / 35.17 / 35.2s | ✗ |
+| 1.5x | 32,401 / 40.9K / 20.84 / 56.38 / 62.4s | ✗ |
+
+HCCL_BUFFSIZE=512（EP 域拓扑强制，见 §5）；32768 在 util 0.80 + async ON 下运行时
+OOM，按用户决定记为容量结论、缺格。对照分析见 §3.5。
+
 ## 3. 结论
 
 ### 3.1 AFD vs baseline（同为 async ON，公平对照）
@@ -79,6 +92,26 @@ baseline 的 +4.7% 不能归于调度器，是解耦架构本身的收益**。�
 TP8 更宽的 attention 补不回引擎数减半：DP 值大的布局（更多引擎、更轻排队）
 严格占优，dp6tp4 保持默认。
 
+### 3.5 baseline 内部拓扑对照：DP8TP2 vs DP4TP4（同 8k、async ON）
+
+| 速率 | DP8TP2 eff (Δ vs DP4TP4) | DP8TP2 TTFT p99 | DP4TP4 TTFT p99 |
+|---|---|---|---|
+| 0.5x | 16,368 (-2.2%) | 15.81s | 11.26s |
+| 0.75x | 24,062 (-1.5%) | 23.04s | 13.18s |
+| 1x | 29,127 (-6.2%) | 30.49s | 19.98s |
+| 1.25x | 33,888 (+3.8%) | 35.17s | 35.72s |
+| 1.5x | 32,401 (+4.8%) | 56.38s | 59.18s |
+
+- **次满载域 DP8TP2 全面更差**（eff -1.5~-6%,TTFT 尾接近翻倍）：TP2 把每引擎
+  attention 宽度砍半,单条 prefill 变慢,排队立刻显形。
+- 仅深超载（1.25x/1.5x）反超 +4~5%（8 个引擎排空队列更快）,但两边 TTFT 都已
+  35–56s,无实用意义。
+- **DP8TP2-32768 不可行**：util 0.80 + async ON 下运行时 NPU OOM（TP2 每卡权重
+  翻倍 + HCCL buffer 占用,KV 余量不足;启动估算通过、跑到 79/512 时爆）,
+  按用户决定记为容量结论、缺格。
+- 16 卡单机最终排序：**AFD token-65536 > AFD request-65536 ≈ baseline DP4TP4-32k
+  > baseline 8k（任一拓扑）**,DP8TP2 垫底。
+
 ## 4. 数据与复算
 
 - 结果 JSON：`bench_results/dsv4_afd_flash_xnode32/dp4tp2_single_sweeps/`（17 格，
@@ -97,6 +130,9 @@ TP8 更宽的 attention 补不回引擎数减半：DP 值大的布局（更多�
   artifacts/插件入口点，~3min/pod，全程无重编译。
 - **HCCL_BUFFSIZE 教训**：单机 DP4TP2+FLASHCOMM1+mbt65536 用旧 DP2TP4 配方的
   1024 直接 EngineDeadError，**4096 才行**（已录 playbook 报错签名表）。
+  baseline DP8TP2 反向踩坑：EP 域（epWorldSize=16）需要 **279MB**，默认 200MB
+  启动即挂（"HCCL_BUFFSIZE_EP is too SMALL ... 279MB"），**512 才行**——
+  buffer 需求随拓扑走，别抄任何一组的旧值。
 - 双 pod 并行实验纪律：按 pod 分线（base-2=baseline、xnode-2=AFD），单节点
   驱动只清本 pod；换 AFD 拓扑栈前必须清掉对端残留 connector（会回连
   host:1239 污染新栈 rank 握手）。

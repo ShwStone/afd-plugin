@@ -11,6 +11,11 @@ mml 70000. Per-series config:
   1.25x/1.5x completed here after that server died on a manual 1.5x attempt)
 - **base-async 8192 / 32768** — stock DP4TP4EP16, ASYNC_SCHEDULING=1 (retest of
   `../baseline1x/` which predated the async flip)
+- **base-dp8tp2-8192** — stock DP8TP2EP16 (HCCL_BUFFSIZE=512, topology-forced:
+  EP window needs 279MB at epWorldSize=16), async ON.  **mbt32768 does not
+  exist for DP8TP2**: runtime NPU OOM at util 0.80 + async ON (TP2 doubles
+  per-rank weights; 770MB alloc failed with 313MB free) — accepted as a
+  capacity finding, cells intentionally absent.
 - **base-noasync** — the 2026-09-02 cells, kept for the async effect
 
 peak = max 15s-bucket service rate. Files: `base1xas_*.json` (baseline async),
@@ -26,6 +31,20 @@ peak = max 15s-bucket service rate. Files: `base1xas_*.json` (baseline async),
 | base-async 8192 | 16,735 (95/11.3/27K) | 24,425 (93/13.2/36K) | 31,058 (89/20.0/39K) | 32,645 (75/35.7/39K) | 30,917 (59/59.2/38K) |
 | base-noasync 32768 | 16,885 | 24,644 | 31,276 | — | — |
 | base-noasync 8192 | 16,961 | 23,922 | 29,770 | — | — |
+| base-dp8tp2-8192 | 16,368 (93/15.8/27K) | 24,062 (92/23.0/37K) | 29,127 (83/30.5/41K) | 33,888 (77/35.2/50K) | 32,401 (62/56.4/41K) |
+| base-dp8tp2-32768 | OOM (runtime) | OOM | OOM | OOM | OOM |
+
+## DP8TP2 vs DP4TP4 (equal cards, both 8k, async ON)
+
+- Sub-capacity rates: DP8TP2 eff -1.5~-6% and **TTFT p99 much worse** (0.75x
+  23.0 vs 13.2s; 1x 30.5 vs 20.0s) — TP2 halves per-engine attention width,
+  so every prefill is slower and the deeper queue shows immediately.
+- Deep overload (1.25x/1.5x): DP8TP2 slightly ahead (+3.8%/+4.8% eff) — more
+  engines drain the backlog faster — but TTFT is already 35-56s for both.
+- **mbt32768 is infeasible** on DP8TP2 at the frozen knobs (runtime NPU OOM).
+- Net: DP8TP2 loses to DP4TP4 for this long-prefill workload; the single-node
+  ranking is **AFD tok-65536 > AFD req-65536 ≈ base-DP4TP4-32k > base-8k
+  (either topology)**.
 
 ## Verdicts
 
