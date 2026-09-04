@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>单机 16 卡速率扫描 — AFD vs baseline（2026-09-04）</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body { font: 13px/1.45 -apple-system, "Segoe UI", sans-serif; margin: 18px;
+         background: #fafafa; color: #111; }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  .sub { color: #555; font-size: 12px; margin-bottom: 14px; }
+  .panel { background: #fff; border: 1px solid #ddd; border-radius: 8px;
+           padding: 14px 16px 10px; margin-bottom: 16px; }
+  .panel h2 { font-size: 14px; margin: 0 0 8px; }
+  .chartbox { position: relative; height: 340px; }
+  .legend-note { color: #555; font-size: 12px; margin-top: 2px; }
+</style>
+</head>
+<body>
+<h1>单机 16 卡速率扫描：AFD (DP4TP2+EP8, mbt=65536) vs baseline (DP4TP4EP16)</h1>
+<div class="sub">formal_1（512 请求，长 prefill），async-sched ON，util 0.80，2026-09-04。
+颜色 = 系统（<b style="color:#0072B2">AFD 蓝</b> / <b style="color:#B7791F">baseline 橙</b>），
+线型 = 配置（实线 = 各自最优：AFD token-split / baseline-32k；虚线 = AFD request-split / baseline-8k）。
+横轴为供给速率（tok/s）。DP8TP2 不含（32k OOM 缺格）。</div>
+<div id="charts"></div>
+<script>
+const P = {"offered":[17535,26303,35071,43839,52606],"labels":["0.5x","0.75x","1x","1.25x","1.5x"],"series":{"afd_token":[{"p50":2.9485917910933495,"p99":8.971494033373892,"eff":17074.664069946957,"peak":30291.666666666668,"slo10":99.4140625},{"p50":3.248642699792981,"p99":10.711619040071964,"eff":25230.383517162125,"peak":40679.8,"slo10":97.65625},{"p50":4.647047616541386,"p99":15.571272809319199,"eff":32829.56406539334,"peak":44740.8,"slo10":85.15625},{"p50":10.67895271629095,"p99":25.63216037202626,"eff":37321.343538473804,"peak":47178.86666666667,"slo10":44.3359375},{"p50":16.41318510659039,"p99":34.315083190314475,"eff":40095.72124007878,"peak":46606.933333333334,"slo10":35.9375}],"afd_request":[{"p50":2.484372677281499,"p99":9.940375748798251,"eff":16852.608899005074,"peak":33840.46666666667,"slo10":99.0234375},{"p50":3.1430068593472242,"p99":10.392780750207582,"eff":24984.486335112408,"peak":40712.46666666667,"slo10":98.828125},{"p50":5.521880015730858,"p99":15.82204737700522,"eff":32742.438155514566,"peak":42090.333333333336,"slo10":80.2734375},{"p50":12.440927565097809,"p99":27.061654370017347,"eff":36856.01542407145,"peak":43824.2,"slo10":43.1640625},{"p50":17.917839854955673,"p99":35.9993586942926,"eff":36837.389118676,"peak":44266.86666666667,"slo10":30.078125}],"base_32k":[{"p50":8.783007197082043,"p99":18.785226159580034,"eff":16795.647497490434,"peak":31121.2,"slo10":67.3828125},{"p50":11.011661298573017,"p99":20.50862399429082,"eff":23928.07973981482,"peak":42651.0,"slo10":36.71875},{"p50":11.199067234992981,"p99":21.79811046808958,"eff":31339.885252494725,"peak":45287.333333333336,"slo10":33.984375},{"p50":15.632617130875587,"p99":26.373950641825793,"eff":35021.65910697157,"peak":45799.8,"slo10":14.6484375},{"p50":18.410279612988234,"p99":36.60428586110473,"eff":36925.09656902559,"peak":45375.666666666664,"slo10":18.1640625}],"base_8k":[{"p50":3.0610323529690504,"p99":11.262912485972041,"eff":16734.675880430583,"peak":27426.666666666668,"slo10":97.65625},{"p50":4.229645086452365,"p99":13.176945549212391,"eff":24425.011484282473,"peak":36448.666666666664,"slo10":93.359375},{"p50":7.433610875159502,"p99":19.981722098179162,"eff":31058.082222854508,"peak":38603.6,"slo10":65.234375},{"p50":15.130225781351328,"p99":35.72156850051134,"eff":32645.394229336584,"peak":38533.26666666667,"slo10":37.6953125},{"p50":23.304174745455384,"p99":59.184842513129084,"eff":30917.027571713763,"peak":38328.6,"slo10":28.125}]},"colors":{"AFD":"#0072B2","baseline":"#E69F00"},"labels_map":{"afd_token":"AFD token-split 65536","afd_request":"AFD request-split 65536","base_32k":"baseline mbt=32768","base_8k":"baseline mbt=8192"},"family":{"afd_token":"AFD","afd_request":"AFD","base_32k":"baseline","base_8k":"baseline"},"dash":{"afd_token":[],"afd_request":[7,5],"base_32k":[],"base_8k":[7,5]}};
+const KEYS = ["afd_token", "afd_request", "base_32k", "base_8k"];
+const CHARTS = [
+  { id: "p50",  title: "TTFT p50（s）",            unit: "s",    yfmt: v => v.toFixed(1) },
+  { id: "p99",  title: "TTFT p99（s）",            unit: "s",    yfmt: v => v.toFixed(0) },
+  { id: "eff",  title: "有效吞吐（tok/s）",         unit: "tok/s", yfmt: v => (v/1000).toFixed(0) + "K" },
+  { id: "peak", title: "峰值 15s 服务速率（tok/s）", unit: "tok/s", yfmt: v => (v/1000).toFixed(0) + "K" },
+  { id: "slo10",title: "10s TTFT SLO 达成率（%）",   unit: "%",    yfmt: v => v.toFixed(0) },
+];
+const wrap = document.getElementById("charts");
+for (const c of CHARTS) {
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  panel.innerHTML = `<h2>${c.title}</h2><div class="chartbox"><canvas id="cv_${c.id}"></canvas></div>`;
+  wrap.appendChild(panel);
+  new Chart(document.getElementById(`cv_${c.id}`), {
+    type: "line",
+    data: {
+      labels: P.offered,
+      datasets: KEYS.map(k => ({
+        label: P.labels_map[k],
+        data: P.series[k].map(m => m[c.id]),
+        borderColor: P.colors[P.family[k]],
+        backgroundColor: P.colors[P.family[k]],
+        borderDash: P.dash[k],
+        borderWidth: 2,
+        pointRadius: 4,
+        pointHoverRadius: 6,
+        tension: 0.15,
+        spanGaps: false,
+      })),
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "nearest", intersect: false },
+      scales: {
+        x: {
+          title: { display: true, text: "供给速率（tok/s）" },
+          ticks: { callback: function(v, i) { return P.labels[i] + "\n" + (P.offered[i]/1000) + "K"; } },
+          grid: { color: "#eee" },
+        },
+        y: {
+          title: { display: true, text: c.unit },
+          grid: { color: "#eee" },
+        },
+      },
+      plugins: {
+        legend: { position: "top", labels: { usePointStyle: true, pointStyle: "line", font: { size: 12 } } },
+        tooltip: {
+          callbacks: {
+            title: items => `供给 ${P.labels[items[0].dataIndex]}（${P.offered[items[0].dataIndex].toLocaleString()} tok/s）`,
+            label: item => ` ${item.dataset.label}: ${c.yfmt(item.parsed.y)} ${c.unit}`,
+          },
+        },
+      },
+    },
+  });
+}
+</script>
+</body>
+</html>
