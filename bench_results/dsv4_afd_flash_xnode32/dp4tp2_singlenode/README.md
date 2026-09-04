@@ -38,22 +38,38 @@ topology is untested; 4096 is the go-to for single-node 65536 now.
 
 ## vs baseline DP4TP4EP16 (same pod, 16 cards, no AFD)
 
-Baseline source: `../baseline1x/` (2026-09-02, single instance, best cell =
-mbt32768).  Each side runs its own best-known mbt: baseline 32768 (65536 not
+Baseline source: `../baseline1x/` (2026-09-02, single instance, mbt 8192 and
+32768).  Each side runs its own best-known mbt: baseline 32768 (65536 not
 viable for it), AFD 65536.  Note the baseline cells predate the async-sched
 default flip, so baseline = async OFF while AFD = async ON — part of the 1x
 throughput delta may be scheduler, not decoupling (async alone measured
 +3.5-4.7% on other stacks).  The TTFT/drain columns are confound-free.
+peak = max 15s-bucket service rate (tools/itask/bucket15_summary.py).
 
-| rate | AFD eff | base32k eff | Δeff | AFD p99 | base32k p99 | Δp99 | AFD drain | base drain |
-|-------|---------|-------------|------|---------|-------------|------|-----------|------------|
-| 0.5x  | 16,853 | 16,885 | -0.2% | 9.94  | 15.31 | -35% | 12.2 | 11.6 |
-| 0.75x | 24,984 | 24,644 | +1.4% | 10.39 | 16.83 | -38% | 10.6 | 13.5 |
-| 1x    | 32,742 | 31,276 | +4.7% | 15.82 | 22.76 | -30% | 10.7 | 18.2 |
+| rate | config | eff tok/s | ttft p50/p99 (s) | drain_s | peak_15s |
+|-------+--------------------------+-----------+-----------------+---------+----------|
+| 0.5x  | AFD dp4tp2+ep8 mbt65536  | 16,853 | 2.48 /  9.94 | 12.2 | 33,840 |
+| 0.5x  | base mbt8192             | 16,961 | 3.02 / 10.54 | 10.2 | 27,190 |
+| 0.5x  | base mbt32768            | 16,885 | 6.21 / 15.31 | 11.6 | 28,239 |
+| 0.75x | AFD dp4tp2+ep8 mbt65536  | 24,984 | 3.14 / 10.39 | 10.6 | 40,712 |
+| 0.75x | base mbt8192             | 23,885 | 3.98 / 15.03 | 19.9 | 34,883 |
+| 0.75x | base mbt32768            | 24,644 | 5.99 / 16.83 | 13.5 | 43,128 |
+| 1x    | AFD dp4tp2+ep8 mbt65536  | 32,742 | 5.52 / 15.82 | 10.7 | 42,090 |
+| 1x    | base mbt8192             | 29,687 | 8.96 / 24.02 | 26.7 | 36,995 |
+| 1x    | base mbt32768            | 31,276 | 7.74 / 22.76 | 18.2 | 45,118 |
 
-(vs baseline mbt8192: 1x eff 29,770 -> AFD +10.0%, p99 24.02 -> -34%.)
+Deltas vs baseline mbt32768: eff -0.2% / +1.4% / +4.7%;  TTFT p99 -35% / -38% / -30%.
+Deltas vs baseline mbt8192:  eff -0.6% / +4.4% / +10.0%; TTFT p99 -6%  / -31% / -34%.
 
 Reading: at sub-capacity rates throughput is parity (both follow supply) and
 AFD's win is **TTFT tail -30~38% at every rate** plus flatter drain.  At 1x
-AFD adds +4.7% eff with 40% less drain.  The p50 advantage (2.5-3.1s vs 6.0s
-at 0.5x/0.75x) comes from mbt65536 single-chunk prefill.
+AFD adds +4.7%/+10.0% eff with 40-60% less drain.  The p50 advantage
+(2.5-3.1s vs 6.0s at 0.5x/0.75x) comes from mbt65536 single-chunk prefill.
+
+Peak 15s burst: AFD 42.1K @1x vs baseline32768 45.1K (-7%) and baseline8192
+37.0K (+14%).  AFD's burst profile is flatter across rates (33.8 -> 40.7 ->
+42.1K) — the ubatch pipeline smooths output instead of stacking burst chunks.
+
+Sustained capacity: **knee not measured** — 1x was still supply-following
+(93.4%, drain 10.7s), so capacity is only bounded below by ~33K tok/s.
+Needs 1.5x/2x overload cells to locate.
