@@ -4,6 +4,9 @@
 # Identical to baseline1x_async_runs.sh (same rates, same knobs, same mbt
 # grid) except the topology: DP_SIZE=8 TP_SIZE=2 instead of DP4TP4 — the
 # DP8TP2-vs-DP4TP4 comparison isolates the DP/TP split at equal card count.
+# HCCL_BUFFSIZE=512 is topology-forced: the EP dispatch/combine domain needs
+# 279MB at epWorldSize=16 (DP8TP2), and the 200MB default that suffices for
+# DP4TP4 fails profile_run ("HCCL_BUFFSIZE_EP is too SMALL ... 279MB").
 #
 # Usage: POD=v4f-base-2 baseline1x_async_dp8tp2_runs.sh
 set -uo pipefail
@@ -42,7 +45,7 @@ for MBT in 8192 32768; do
   TAG=base1xasdp8tp2_mbt${MBT}
   say "== mbt=$MBT: cleanup + start baseline DP8TP2 (ASYNC_SCHEDULING=1) =="
   $S "$POD" -- bash /tmp/xnode32_cleanup.sh 2>&1 | tr -d '\r' | tail -2
-  $S "$POD" -- bash -c "setsid bash -c 'env DP_SIZE=8 TP_SIZE=2 MAX_NUM_BATCHED_TOKENS=$MBT PORT=8000 ADDITIONAL_CONFIG=cws ASYNC_SCHEDULING=1 nohup bash $BASE_LAUNCHER > /tmp/${TAG}.log 2>&1 &' ; echo started" 2>&1 | tr -d '\r' | tail -1
+  $S "$POD" -- bash -c "setsid bash -c 'env DP_SIZE=8 TP_SIZE=2 HCCL_BUFFSIZE=512 MAX_NUM_BATCHED_TOKENS=$MBT PORT=8000 ADDITIONAL_CONFIG=cws ASYNC_SCHEDULING=1 nohup bash $BASE_LAUNCHER > /tmp/${TAG}.log 2>&1 &' ; echo started" 2>&1 | tr -d '\r' | tail -1
 
   say "== wait readiness =="
   READY=0
