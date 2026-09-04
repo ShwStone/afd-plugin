@@ -64,8 +64,8 @@ def metrics(path: Path) -> dict:
     }
 
 
-def main() -> None:
-    out = {
+def build_payload() -> dict:
+    return {
         "offered": OFFERED,
         "labels": RATE_LABELS,
         "series": {k: [metrics(BASE / f) for f in files] for k, files in SERIES.items()},
@@ -78,6 +78,10 @@ def main() -> None:
                 "better": {"p50": "low", "p99": "low", "eff": "high", "peak": "high", "slo10": "high"},
                 "noRel": ["slo10"]},
     }
+
+
+def main() -> None:
+    out = build_payload()
     html = TEMPLATE.replace("__PAYLOAD__", json.dumps(out, separators=(",", ":")))
     dst = BASE / "line_charts_20260904.html"
     dst.write_text(html)
