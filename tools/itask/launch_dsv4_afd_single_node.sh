@@ -43,6 +43,10 @@ if [[ "$ROLE" == attention ]]; then API_PORT=$ATTN_API_PORT; else API_PORT=$FFN_
 # FlashComm1 (SP) is attention-only: FFN runs TP1 where Flash Comm v1 is
 # rejected by config validation.
 : "${FLASHCOMM1:=0}"
+# Attention layout on NPUs 0-7.  Default DP2TP4; DP4TP2 etc. are valid as long
+# as ranks stay within the 8 attention NPUs (DP*TP == 8).
+: "${ATTN_DP_SIZE:=2}"
+: "${ATTN_TP_SIZE:=4}"
 # DSV4-Flash-w8a8-mtp; override when the task mounts the weights elsewhere.
 : "${MODEL_PATH:=/mnt/sfs_turbo/models/DeepSeek-V4-Flash-w8a8-mtp}"
 
@@ -120,10 +124,13 @@ else
 fi
 
 if [[ "$ROLE" == attention ]]; then
+  if (( ATTN_DP_SIZE * ATTN_TP_SIZE != 8 )); then
+    echo "ATTN_DP_SIZE*ATTN_TP_SIZE must be 8 on the single-node layout (got $ATTN_DP_SIZE*$ATTN_TP_SIZE)" >&2
+    exit 2
+  fi
   export ASCEND_RT_VISIBLE_DEVICES="$ATTENTION_DEVICES"
-  # One vLLM DP2TP4 process group on NPUs 0-7 (two replicas share the API
-  # server); hosts the API server.
-  PARALLEL_ARGS=(--data-parallel-size 2 --tensor-parallel-size 4)
+  # One vLLM DPxTP process group on NPUs 0-7 (replicas share the API server).
+  PARALLEL_ARGS=(--data-parallel-size "$ATTN_DP_SIZE" --tensor-parallel-size "$ATTN_TP_SIZE")
   WORKER=afd_plugin.v1.worker.npu.AFDNPUAttentionWorker
   MODEL_NAME=dsv4-afd-attention
   API_SERVER_ARGS=(--api-server-count 1)
@@ -135,7 +142,7 @@ else
   API_SERVER_ARGS=(--api-server-count 1)
 fi
 
-CONNECTOR_EXTRA='"dynamicQuant":1,"attn_ranks_per_dp":4,"async_moe_ubatching":'"$ASYNC_MOE_UBATCHING"',"async_moe_split":"'"$ASYNC_MOE_SPLIT"'"'
+CONNECTOR_EXTRA='"dynamicQuant":1,"attn_ranks_per_dp":'"$ATTN_TP_SIZE"',"async_moe_ubatching":'"$ASYNC_MOE_UBATCHING"',"async_moe_split":"'"$ASYNC_MOE_SPLIT"'"'
 if [[ -n "$CONNECTOR_HCCL_BUFFER_SIZE_MB" ]]; then
   CONNECTOR_EXTRA="$CONNECTOR_EXTRA,\"hccl_buffer_size\":$CONNECTOR_HCCL_BUFFER_SIZE_MB"
 fi
