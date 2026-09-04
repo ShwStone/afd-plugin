@@ -35,3 +35,25 @@ topology is untested; 4096 is the go-to for single-node 65536 now.
   showed at 1x (33.8K, also supply-limited).  Where dp4tp2 sits vs dp6tp4
   under overload (1.5x/2x) is untested.
 - Device latency stays 6-8ms p99 through all cells.
+
+## vs baseline DP4TP4EP16 (same pod, 16 cards, no AFD)
+
+Baseline source: `../baseline1x/` (2026-09-02, single instance, best cell =
+mbt32768).  Each side runs its own best-known mbt: baseline 32768 (65536 not
+viable for it), AFD 65536.  Note the baseline cells predate the async-sched
+default flip, so baseline = async OFF while AFD = async ON — part of the 1x
+throughput delta may be scheduler, not decoupling (async alone measured
++3.5-4.7% on other stacks).  The TTFT/drain columns are confound-free.
+
+| rate | AFD eff | base32k eff | Δeff | AFD p99 | base32k p99 | Δp99 | AFD drain | base drain |
+|-------|---------|-------------|------|---------|-------------|------|-----------|------------|
+| 0.5x  | 16,853 | 16,885 | -0.2% | 9.94  | 15.31 | -35% | 12.2 | 11.6 |
+| 0.75x | 24,984 | 24,644 | +1.4% | 10.39 | 16.83 | -38% | 10.6 | 13.5 |
+| 1x    | 32,742 | 31,276 | +4.7% | 15.82 | 22.76 | -30% | 10.7 | 18.2 |
+
+(vs baseline mbt8192: 1x eff 29,770 -> AFD +10.0%, p99 24.02 -> -34%.)
+
+Reading: at sub-capacity rates throughput is parity (both follow supply) and
+AFD's win is **TTFT tail -30~38% at every rate** plus flatter drain.  At 1x
+AFD adds +4.7% eff with 40% less drain.  The p50 advantage (2.5-3.1s vs 6.0s
+at 0.5x/0.75x) comes from mbt65536 single-chunk prefill.
