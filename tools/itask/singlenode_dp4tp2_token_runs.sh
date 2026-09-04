@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Single-node AFD DP4TP2+EP8, token-split ubatching, rate sweep 0.5x -> 1.5x
-# (0.25x steps) at mbt {8192, 32768}.  Companion to baseline1x_async_runs.sh:
-# same rates, same mbt grid, async-sched ON, CWS on, FLASHCOMM1 on — only the
-# serving architecture differs (and mbt within a rate, as on the baseline side).
-# ASYNC_MOE_SPLIT=token; all other knobs match the dp4tp2_mbt65536 run.
+# (0.25x steps) at mbt=65536 (the AFD-validated optimum; HCCL_BUFFSIZE=4096).
+# Companion to baseline1x_async_runs.sh: same rates, async-sched ON, CWS on,
+# FLASHCOMM1 on.  ASYNC_MOE_SPLIT=token; every other knob matches the
+# dp4tp2_mbt65536 request-split run, so split mode is the only delta vs it.
 #
-# Usage: POD=v4f-base-2 NODE1_IP=<pod ip> singlenode_dp4tp2_token_runs.sh
+# Usage: POD=v4f-xnode-2 NODE1_IP=<pod ip> singlenode_dp4tp2_token_runs.sh
 set -uo pipefail
 
 POD=${POD:?set POD}
@@ -38,7 +38,7 @@ run_plan() { # $1=mbt $2=plan file $3=output tag
   say "== $TAG done: $($S "$POD" -- bash -c "grep -o 'REPLAY_OK[^{]*' /tmp/${TAG}.client.log | head -1" 2>/dev/null | tr -d '\r' | tail -1)"
 }
 
-for MBT in 8192 32768; do
+for MBT in 65536; do
   TAG=dp4tp2tok_mbt${MBT}
   say "== mbt=$MBT: cleanup + start AFD dp4tp2 token-split =="
   $S "$POD" -- bash /tmp/xnode32_cleanup.sh 2>&1 | tr -d '\r' | tail -2
