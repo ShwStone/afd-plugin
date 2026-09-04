@@ -4,7 +4,7 @@ token-split behind least_load_router) vs the 32-card dual-node dp6tp4 AFD and
 the dual-instance DP4TP4 baseline — 1x / 1.5x / 2x, formal_1.
 
 Color = deployment family, dash = config within family:
-  blue   = DP4TP2+EP8 16c instances (solid = 2x via router, dashed = 1x ref)
+  blue   = DP4TP2+EP8 16c instances via router (solid)
   orange = dp6tp4+DP8EP8 dual-node AFD (solid = token-split, dashed = request)
   green  = 2xDPR4TP4EP16 baseline2x (solid = mbt8192, dashed = mbt32768)
 
@@ -18,11 +18,8 @@ BASE = Path(__file__).resolve().parent.parent.parent / "bench_results" / "dsv4_a
 
 OFFERED = [35071, 52606, 70142]
 LABELS = ["1x", "1.5x", "2x"]
-# single-instance token reference has no 2x cell (it saturates past 1.5x)
-SINGLE = "dp4tp2_single_sweeps/dp4tp2tok_mbt65536_"
 SERIES = {
     "inst2_tok": [f"singlenode2x/singlenode2x_dp4tp2tok_{t}.json" for t in ["1x", "fast1p5x", "fast2x"]],
-    "inst1_tok": [SINGLE + "1x.json", SINGLE + "1p5x.json", None],
     "dp6tp4_token": [f"async_sched/xnode32_token_as_mbt65536_{t}.json" for t in ["1x", "fast1p5x", "fast2x"]],
     "dp6tp4_request": [f"async_sched/xnode32_request_as_mbt65536_{t}.json" for t in ["1x", "fast1p5x", "fast2x"]],
     "base2x_8k": [f"async_sched/base2x_as_mbt8192_{t}.json" for t in ["1x", "fast1p5x", "fast2x"]],
@@ -30,16 +27,15 @@ SERIES = {
 }
 LABELS_MAP = {
     "inst2_tok": "2×DP4TP2+EP8 实例+router（token）",
-    "inst1_tok": "1×DP4TP2+EP8 实例（token,参考）",
     "dp6tp4_token": "DP6TP4 双机 token",
     "dp6tp4_request": "DP6TP4 双机 request",
     "base2x_8k": "baseline2x mbt=8192",
     "base2x_32k": "baseline2x mbt=32768",
 }
-FAMILY = {"inst2_tok": "blue", "inst1_tok": "blue",
+FAMILY = {"inst2_tok": "blue",
           "dp6tp4_token": "orange", "dp6tp4_request": "orange",
           "base2x_8k": "green", "base2x_32k": "green"}
-DASH = {"inst2_tok": [], "inst1_tok": [7, 5],
+DASH = {"inst2_tok": [],
         "dp6tp4_token": [], "dp6tp4_request": [7, 5],
         "base2x_8k": [], "base2x_32k": [7, 5]}
 COLORS = {"blue": "#0072B2", "orange": "#E69F00", "green": "#009E73"}
@@ -103,11 +99,11 @@ TEMPLATE = r"""<!DOCTYPE html>
 <b style="color:#B7791F">橙 = DP6TP4+EP8 双机单实例</b> /
 <b style="color:#1e7d64">绿 = 2×DP4TP4EP16 baseline</b>），
 线型 = 配置（实线/虚线见 图例）。横轴为供给速率（tok/s）。
-1×实例参考线无 2x 格（该配置 1.5x 已饱和）。router 分流实测 766:772。</div>
+router 分流实测 766:772。</div>
 <div id="charts"></div>
 <script>
 const P = __PAYLOAD__;
-const KEYS = ["inst2_tok", "inst1_tok", "dp6tp4_token", "dp6tp4_request", "base2x_8k", "base2x_32k"];
+const KEYS = ["inst2_tok", "dp6tp4_token", "dp6tp4_request", "base2x_8k", "base2x_32k"];
 const CHARTS = [
   { id: "p50",  title: "TTFT p50（s）",             unit: "s",    yfmt: v => v.toFixed(1) },
   { id: "p99",  title: "TTFT p99（s）",             unit: "s",    yfmt: v => v.toFixed(0) },
